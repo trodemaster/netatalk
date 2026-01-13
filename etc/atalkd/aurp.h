@@ -250,6 +250,10 @@ void aurp_flush_events(struct aurp_peer *peer);
 /* Route management for AURP */
 int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
                         uint16_t lastnet, uint8_t hops);
+void aurp_rtmp_remove_route(struct aurp_peer *peer, uint16_t firstnet,
+                            uint16_t lastnet);
+void aurp_rtmp_update_route(struct aurp_peer *peer, uint16_t firstnet,
+                            uint16_t lastnet, uint8_t hops);
 void aurp_rtmp_delete_routes(struct aurp_peer *peer);
 void aurp_rtmp_notify_route_added(struct rtmptab *rt);
 void aurp_rtmp_notify_route_deleted(struct rtmptab *rt);

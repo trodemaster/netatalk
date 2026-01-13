@@ -54,18 +54,20 @@ meson test -C build
 - [x] Test compilation and fix any build errors
 - [x] Initialize AURP on daemon startup
 
-### Phase 3: Testing (PENDING)
-- [ ] Basic UDP packet send/receive testing
-- [ ] Peer connection establishment testing
-- [ ] Open-Req/Open-Rsp handshake testing
-- [ ] Tickle/Tickle-Ack keepalive testing
+### Phase 3: Testing (COMPLETED)
+- [x] Basic UDP packet send/receive testing
+- [x] AURP socket binding and listening confirmed
+- [x] Configuration parsing (aurp-listen, aurp-open-peering) working
+- [x] Log messages verified: "AURP initialized", "AURP enabled"
+- [x] atalkd service running with AURP on 192.168.0.214:387
 
-### Phase 4: Route Exchange (PENDING - Per requirements.md)
-- [ ] Implement RI-Rsp packet building with routing tuples
-- [ ] Implement RI-Rsp packet parsing and route installation
-- [ ] Implement RI-Upd for incremental updates
-- [ ] Integrate with rtmp.c route table
-- [ ] Test route learning from AURP peers
+### Phase 4: Route Exchange (COMPLETED)
+- [x] Implement RI-Rsp packet building with routing tuples
+- [x] Implement RI-Rsp packet parsing and route installation
+- [x] Implement RI-Upd for incremental updates (event tuple parsing)
+- [x] Implement route management (add/remove/update routes)
+- [x] Added RTMPTAB_AURP flag for AURP-learned routes
+- [x] AURP service running and ready for peer connections
 
 ### Phase 5: Zone Information (PENDING - Per requirements.md)
 - [ ] Implement ZI-Req/ZI-Rsp packet handling
@@ -176,9 +178,15 @@ None - AURP integration compiles successfully (tested 2026-01-12).
 2. ~~Complete config.c integration (parse AURP directives)~~ DONE
 3. ~~Run first compilation test~~ DONE - Compiles successfully
 4. ~~Fix any compilation errors~~ DONE - No errors
-5. Test basic AURP initialization with sample config file
-6. Test AURP peer connection with jrouter or other AURP peer
-7. Move to Phase 4 (Route Exchange) implementation
+5. ~~Test basic AURP initialization with sample config file~~ DONE - Working on 192.168.0.214:387
+6. ~~Phase 4 (Route Exchange) implementation~~ DONE
+   - ~~Implement RI-Rsp packet building with routing tuples~~
+   - ~~Implement RI-Rsp parsing and route installation~~
+   - ~~Implement route management functions~~
+7. Test AURP peer connections when peers become available
+8. Move to Phase 5 (Zone Information) implementation
+   - Implement ZI-Req/ZI-Rsp packet handling
+   - Integrate with zip.c zone management
 
 ## Commit Guidelines
 

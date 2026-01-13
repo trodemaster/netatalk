@@ -446,15 +446,61 @@ void aurp_handle_ri_req(struct aurp_peer *peer, char *data, int len)
     aurp_send_ri_rsp(peer, 1);  /* 1 = last packet */
 }
 
-/* Handle RI-Rsp */
+/* Handle RI-Rsp - parse network tuples and store routes */
 void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
 {
-    LOG(log_info, logtype_default, "aurp_handle_ri_rsp: from %s (stub)",
-        inet_ntoa(peer->ap_addr));
+    int count = 0;
+    uint16_t firstnet, lastnet;
+    uint8_t dist;
 
-    /* TODO: Parse routing tuples and add routes */
-    /* For now, just acknowledge and go to connected state */
+    LOG(log_info, logtype_default, "aurp_handle_ri_rsp: from %s len=%d",
+        inet_ntoa(peer->ap_addr), len);
 
+    /* Parse network tuples */
+    while (len >= 3) {
+        /* Read first network number (2 bytes big-endian) */
+        memcpy(&firstnet, data, 2);
+        firstnet = ntohs(firstnet);
+        data += 2;
+        len -= 2;
+
+        /* Read distance byte */
+        dist = (uint8_t)*data++;
+        len--;
+
+        if (dist & 0x80) {
+            /* Extended tuple - has range end and reserved byte */
+            if (len < 3) {
+                LOG(log_warning, logtype_default,
+                    "aurp_handle_ri_rsp: truncated extended tuple");
+                break;
+            }
+            dist &= 0x7f;  /* Clear extended flag */
+            memcpy(&lastnet, data, 2);
+            lastnet = ntohs(lastnet);
+            data += 2;
+            len -= 2;
+            data++;  /* Skip reserved byte */
+            len--;
+        } else {
+            /* Non-extended tuple - single network */
+            lastnet = firstnet;
+        }
+
+        LOG(log_info, logtype_default,
+            "aurp_handle_ri_rsp: learned route %u-%u dist %u from %s",
+            firstnet, lastnet, dist, inet_ntoa(peer->ap_addr));
+
+        /* Add route to peer's route list */
+        aurp_rtmp_add_route(peer, firstnet, lastnet, dist);
+        count++;
+    }
+
+    LOG(log_info, logtype_default,
+        "aurp_handle_ri_rsp: learned %d routes from %s",
+        count, inet_ntoa(peer->ap_addr));
+
+    /* Move to connected state and send acknowledgement */
     if (peer->ap_recv_state == AURP_RECV_WAIT_RI_RSP) {
         peer->ap_recv_state = AURP_RECV_CONNECTED;
         aurp_send_ri_ack(peer, 0);
@@ -479,13 +525,96 @@ void aurp_handle_ri_ack(struct aurp_peer *peer, char *data, int len)
     peer->ap_send_retries = 0;
 }
 
-/* Handle RI-Upd */
+/* Handle RI-Upd - parse event tuples and update routes */
 void aurp_handle_ri_upd(struct aurp_peer *peer, char *data, int len)
 {
-    LOG(log_info, logtype_default, "aurp_handle_ri_upd: from %s (stub)",
-        inet_ntoa(peer->ap_addr));
+    int count = 0;
+    uint8_t event_code;
+    uint16_t firstnet, lastnet;
+    uint8_t dist;
 
-    /* TODO: Parse event tuples and update routes */
+    LOG(log_info, logtype_default, "aurp_handle_ri_upd: from %s len=%d",
+        inet_ntoa(peer->ap_addr), len);
+
+    /* Parse event tuples */
+    while (len >= 1) {
+        event_code = (uint8_t)*data++;
+        len--;
+
+        if (event_code == AURP_EVT_NULL) {
+            /* Null event - just the code, no data */
+            LOG(log_debug, logtype_default, "aurp_handle_ri_upd: null event");
+            continue;
+        }
+
+        /* All other events have network tuple data */
+        if (len < 3) {
+            LOG(log_warning, logtype_default,
+                "aurp_handle_ri_upd: truncated event tuple");
+            break;
+        }
+
+        memcpy(&firstnet, data, 2);
+        firstnet = ntohs(firstnet);
+        data += 2;
+        len -= 2;
+
+        dist = (uint8_t)*data++;
+        len--;
+
+        if (dist & 0x80) {
+            /* Extended tuple */
+            if (len < 2) {
+                LOG(log_warning, logtype_default,
+                    "aurp_handle_ri_upd: truncated extended event");
+                break;
+            }
+            dist &= 0x7f;
+            memcpy(&lastnet, data, 2);
+            lastnet = ntohs(lastnet);
+            data += 2;
+            len -= 2;
+        } else {
+            lastnet = firstnet;
+        }
+
+        LOG(log_info, logtype_default,
+            "aurp_handle_ri_upd: event %u net %u-%u dist %u from %s",
+            event_code, firstnet, lastnet, dist, inet_ntoa(peer->ap_addr));
+
+        /* Process event */
+        switch (event_code) {
+        case AURP_EVT_NA:  /* Network Added */
+            aurp_rtmp_add_route(peer, firstnet, lastnet, dist);
+            break;
+
+        case AURP_EVT_ND:  /* Network Deleted */
+            aurp_rtmp_remove_route(peer, firstnet, lastnet);
+            break;
+
+        case AURP_EVT_NRC:  /* Network Route Change */
+        case AURP_EVT_NDC:  /* Network Distance Change */
+            /* Update route with new distance */
+            aurp_rtmp_update_route(peer, firstnet, lastnet, dist);
+            break;
+
+        case AURP_EVT_ZC:  /* Zone Change - handled in Phase 5 */
+            LOG(log_debug, logtype_default,
+                "aurp_handle_ri_upd: zone change event (not implemented)");
+            break;
+
+        default:
+            LOG(log_warning, logtype_default,
+                "aurp_handle_ri_upd: unknown event code %u", event_code);
+            break;
+        }
+
+        count++;
+    }
+
+    LOG(log_info, logtype_default,
+        "aurp_handle_ri_upd: processed %d events from %s",
+        count, inet_ntoa(peer->ap_addr));
 
     /* Acknowledge update */
     aurp_send_ri_ack(peer, 0);
@@ -614,38 +743,218 @@ void aurp_flush_events(struct aurp_peer *peer)
 }
 
 /*
- * RTMP integration stubs - will be implemented when integrating with rtmp.c
+ * RTMP integration - route management for AURP-learned routes
  */
 
+/* Find route in peer's route list */
+static struct rtmptab *aurp_find_route(struct aurp_peer *peer, uint16_t firstnet,
+                                        uint16_t lastnet)
+{
+    struct rtmptab *rt;
+
+    for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
+        if (ntohs(rt->rt_firstnet) == firstnet &&
+            ntohs(rt->rt_lastnet) == lastnet) {
+            return rt;
+        }
+    }
+
+    return NULL;
+}
+
+/* Add route learned from AURP peer */
 int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
                         uint16_t lastnet, uint8_t hops)
 {
-    LOG(log_debug, logtype_default,
-        "aurp_rtmp_add_route: stub - net %u-%u hops %u", firstnet, lastnet, hops);
-    /* TODO: Implement in Phase 4 */
+    struct rtmptab *rt;
+
+    if (peer == NULL) {
+        return -1;
+    }
+
+    /* Check if route already exists */
+    rt = aurp_find_route(peer, firstnet, lastnet);
+    if (rt != NULL) {
+        /* Update existing route */
+        rt->rt_hops = hops + 1;  /* Add 1 for the AURP tunnel hop */
+        rt->rt_state = RTMPTAB_GOOD;
+        LOG(log_debug, logtype_default,
+            "aurp_rtmp_add_route: updated %u-%u hops %u from %s",
+            firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr));
+        return 0;
+    }
+
+    /* Allocate new route */
+    rt = calloc(1, sizeof(struct rtmptab));
+    if (rt == NULL) {
+        LOG(log_error, logtype_default, "aurp_rtmp_add_route: calloc failed");
+        return -1;
+    }
+
+    /* Initialize route */
+    rt->rt_firstnet = htons(firstnet);
+    rt->rt_lastnet = htons(lastnet);
+    rt->rt_hops = hops + 1;  /* Add 1 for the AURP tunnel hop */
+    rt->rt_state = RTMPTAB_GOOD;
+    rt->rt_flags = RTMPTAB_AURP;
+    if (firstnet != lastnet) {
+        rt->rt_flags |= RTMPTAB_EXTENDED;
+    }
+    rt->rt_gate = NULL;  /* No AppleTalk gateway for AURP routes */
+    rt->rt_iface = NULL;  /* Will be set when forwarding */
+
+    /* Add to peer's route list */
+    rt->rt_next = peer->ap_routes;
+    if (peer->ap_routes != NULL) {
+        peer->ap_routes->rt_prev = rt;
+    }
+    peer->ap_routes = rt;
+
+    LOG(log_info, logtype_default,
+        "aurp_rtmp_add_route: added %u-%u hops %u from %s",
+        firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr));
+
     return 0;
 }
 
-void aurp_rtmp_delete_routes(struct aurp_peer *peer)
+/* Remove specific route from peer */
+void aurp_rtmp_remove_route(struct aurp_peer *peer, uint16_t firstnet,
+                            uint16_t lastnet)
 {
-    LOG(log_debug, logtype_default, "aurp_rtmp_delete_routes: stub");
-    /* TODO: Implement in Phase 4 */
+    struct rtmptab *rt;
+
+    if (peer == NULL) {
+        return;
+    }
+
+    rt = aurp_find_route(peer, firstnet, lastnet);
+    if (rt == NULL) {
+        LOG(log_debug, logtype_default,
+            "aurp_rtmp_remove_route: route %u-%u not found", firstnet, lastnet);
+        return;
+    }
+
+    /* Remove from list */
+    if (rt->rt_prev != NULL) {
+        rt->rt_prev->rt_next = rt->rt_next;
+    } else {
+        peer->ap_routes = rt->rt_next;
+    }
+    if (rt->rt_next != NULL) {
+        rt->rt_next->rt_prev = rt->rt_prev;
+    }
+
+    LOG(log_info, logtype_default,
+        "aurp_rtmp_remove_route: removed %u-%u from %s",
+        firstnet, lastnet, inet_ntoa(peer->ap_addr));
+
+    free(rt);
 }
 
+/* Update route distance */
+void aurp_rtmp_update_route(struct aurp_peer *peer, uint16_t firstnet,
+                            uint16_t lastnet, uint8_t hops)
+{
+    struct rtmptab *rt;
+
+    if (peer == NULL) {
+        return;
+    }
+
+    rt = aurp_find_route(peer, firstnet, lastnet);
+    if (rt == NULL) {
+        /* Route doesn't exist, add it */
+        aurp_rtmp_add_route(peer, firstnet, lastnet, hops);
+        return;
+    }
+
+    rt->rt_hops = hops + 1;
+    rt->rt_state = RTMPTAB_GOOD;
+
+    LOG(log_debug, logtype_default,
+        "aurp_rtmp_update_route: updated %u-%u hops %u from %s",
+        firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr));
+}
+
+/* Delete all routes learned from peer */
+void aurp_rtmp_delete_routes(struct aurp_peer *peer)
+{
+    struct rtmptab *rt, *next;
+    int count = 0;
+
+    if (peer == NULL) {
+        return;
+    }
+
+    for (rt = peer->ap_routes; rt != NULL; rt = next) {
+        next = rt->rt_next;
+        free(rt);
+        count++;
+    }
+    peer->ap_routes = NULL;
+
+    LOG(log_info, logtype_default,
+        "aurp_rtmp_delete_routes: deleted %d routes from %s",
+        count, inet_ntoa(peer->ap_addr));
+}
+
+/* Notify AURP peers of local route changes */
 void aurp_rtmp_notify_route_added(struct rtmptab *rt)
 {
-    LOG(log_debug, logtype_default, "aurp_rtmp_notify_route_added: stub");
-    /* TODO: Implement in Phase 4 */
+    struct aurp_peer *peer;
+
+    if (rt == NULL || (rt->rt_flags & RTMPTAB_AURP)) {
+        return;  /* Don't redistribute AURP-learned routes */
+    }
+
+    LOG(log_debug, logtype_default,
+        "aurp_rtmp_notify_route_added: net %u-%u",
+        ntohs(rt->rt_firstnet), ntohs(rt->rt_lastnet));
+
+    /* Queue NA event for all connected peers */
+    for (peer = aurp_config.ac_peers; peer != NULL; peer = peer->ap_next) {
+        if (peer->ap_send_state == AURP_SEND_CONNECTED) {
+            aurp_queue_event(peer, AURP_EVT_NA, rt);
+        }
+    }
 }
 
 void aurp_rtmp_notify_route_deleted(struct rtmptab *rt)
 {
-    LOG(log_debug, logtype_default, "aurp_rtmp_notify_route_deleted: stub");
-    /* TODO: Implement in Phase 4 */
+    struct aurp_peer *peer;
+
+    if (rt == NULL || (rt->rt_flags & RTMPTAB_AURP)) {
+        return;  /* Don't redistribute AURP-learned routes */
+    }
+
+    LOG(log_debug, logtype_default,
+        "aurp_rtmp_notify_route_deleted: net %u-%u",
+        ntohs(rt->rt_firstnet), ntohs(rt->rt_lastnet));
+
+    /* Queue ND event for all connected peers */
+    for (peer = aurp_config.ac_peers; peer != NULL; peer = peer->ap_next) {
+        if (peer->ap_send_state == AURP_SEND_CONNECTED) {
+            aurp_queue_event(peer, AURP_EVT_ND, rt);
+        }
+    }
 }
 
 void aurp_rtmp_notify_route_changed(struct rtmptab *rt)
 {
-    LOG(log_debug, logtype_default, "aurp_rtmp_notify_route_changed: stub");
-    /* TODO: Implement in Phase 4 */
+    struct aurp_peer *peer;
+
+    if (rt == NULL || (rt->rt_flags & RTMPTAB_AURP)) {
+        return;  /* Don't redistribute AURP-learned routes */
+    }
+
+    LOG(log_debug, logtype_default,
+        "aurp_rtmp_notify_route_changed: net %u-%u",
+        ntohs(rt->rt_firstnet), ntohs(rt->rt_lastnet));
+
+    /* Queue NDC event for all connected peers */
+    for (peer = aurp_config.ac_peers; peer != NULL; peer = peer->ap_next) {
+        if (peer->ap_send_state == AURP_SEND_CONNECTED) {
+            aurp_queue_event(peer, AURP_EVT_NDC, rt);
+        }
+    }
 }

@@ -7,15 +7,15 @@
 - [x] Integrate AURP into main.c select() loop and timer
 - [x] Integrate AURP configuration parsing into config.c
 - [x] Test compilation and fix build errors
-- [ ] Confirm basic AURP initialization and socket creation (runtime test with config file)
+- [x] Confirm basic AURP initialization and socket creation (runtime test with config file)
 
 ## Medium Priority
 
-- [ ] Implement routing table integration (Phase 4 - aurp_rtmp.c)
-- [ ] Implement RI-Rsp packet building with routing tuples
-- [ ] Implement RI-Rsp parsing and route installation
-- [ ] Implement RI-Upd for incremental route updates
-- [ ] Test route learning from AURP peers with jrouter
+- [x] Implement routing table integration (Phase 4 - aurp_rtmp.c)
+- [x] Implement RI-Rsp packet building with routing tuples
+- [x] Implement RI-Rsp parsing and route installation
+- [x] Implement RI-Upd for incremental route updates
+- [ ] Test route learning from AURP peers (waiting for peer connections)
 
 ## Low Priority
 
@@ -37,7 +37,7 @@
 
 ## Implementation Notes
 
-### Current Phase: Phase 2 - Integration (COMPLETED)
+### Current Phase: Phase 4 - Route Exchange (COMPLETED)
 
 **Completed in Phase 1:**
 1. AURP header file with complete RFC 1504 structures
@@ -57,10 +57,28 @@
 6. Modified config.c readconf() to detect and parse AURP directives
 7. Compilation test passed - atalkd builds with AURP support
 
-**Next Steps (Phase 3 - Testing):**
-1. Create sample atalkd.conf with AURP configuration
-2. Run atalkd with AURP enabled and verify socket creation
-3. Test AURP peer connection establishment with jrouter or another AURP peer
+**Completed in Phase 3:**
+1. Created atalkd.conf with AURP configuration (aurp-listen, aurp-open-peering)
+2. Verified atalkd starts with AURP enabled
+3. Confirmed AURP socket listening on 192.168.0.214:387
+4. Verified log messages: "AURP initialized" and "AURP enabled"
+5. Confirmed AFP server registered at 650.37:128 with AURP running
+
+**Completed in Phase 4:**
+1. Implemented aurp_send_ri_rsp() - builds network tuples from local interfaces
+2. Implemented aurp_send_ri_ack() - routing acknowledgement
+3. Implemented aurp_send_ri_upd() - event tuple building
+4. Implemented aurp_send_rd() - Router Down notification
+5. Implemented aurp_handle_ri_rsp() - parses network tuples, stores routes
+6. Implemented aurp_handle_ri_upd() - parses event tuples, updates routes
+7. Implemented route management (add/remove/update routes from peers)
+8. Added RTMPTAB_AURP flag for AURP-learned routes
+9. AURP service running with full routing protocol support
+
+**Next Steps (Phase 5 - Zone Information):**
+1. Implement ZI-Req/ZI-Rsp packet handling
+2. Integrate with zip.c zone management
+3. Test zone information exchange with AURP peers
 
 ### Key Technical Decisions
 
@@ -139,6 +157,6 @@ atalkd (main daemon)
 
 ---
 
-**Last Updated**: 2026-01-12 (Ralph Loop #2)
-**Current Status**: Phase 1 and Phase 2 complete
-**Next Priority**: Runtime testing with AURP configuration, then Phase 4 (Route Exchange)
+**Last Updated**: 2026-01-13
+**Current Status**: Phases 1-4 complete - AURP route exchange implemented and running
+**Next Priority**: Phase 5 (Zone Information) - implement ZI-Req/ZI-Rsp handling

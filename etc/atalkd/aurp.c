@@ -14,15 +14,18 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <atalk/logger.h>
+#include <netatalk/at.h>
 
 #include "aurp.h"
 #include "rtmp.h"
+#include "interface.h"
 
 /* Global AURP configuration */
 struct aurp_config aurp_config = {
@@ -552,32 +555,234 @@ int aurp_send_tickle_ack(struct aurp_peer *peer)
     return 0;
 }
 
-/* Placeholder stubs for other send functions - will be implemented in aurp_peer.c */
+/*
+ * RI-Rsp - Send routing information response
+ * Builds network tuples from our local routes
+ */
 int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
 {
-    /* TODO: Implement in Phase 4 */
-    LOG(log_debug, logtype_default, "aurp_send_ri_rsp: stub called");
+    char buf[AURP_MAX_PKT_SIZE];
+    int len = 0;
+    int n;
+    uint16_t flags = 0;
+    uint16_t tmp;
+    struct interface *iface;
+    extern struct interface *interfaces;
+
+    if (last) {
+        flags |= AURP_FLAG_LAST;
+    }
+
+    /* Build header */
+    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
+                          peer->ap_local_seq, AURP_CMD_RI_RSP, flags);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Build network tuples from our local interfaces */
+    for (iface = interfaces; iface != NULL; iface = iface->i_next) {
+        uint16_t firstnet, lastnet;
+        uint8_t dist;
+
+        /* Skip unconfigured interfaces */
+        if ((iface->i_flags & IFACE_CONFIG) == 0) {
+            continue;
+        }
+
+        /* Skip loopback */
+        if (iface->i_flags & IFACE_LOOPBACK) {
+            continue;
+        }
+
+        firstnet = ntohs(iface->i_rt->rt_firstnet);
+        lastnet = ntohs(iface->i_rt->rt_lastnet);
+        dist = 0;  /* Distance 0 for directly connected networks */
+
+        /* Check buffer space */
+        if (len + 6 > sizeof(buf)) {
+            LOG(log_warning, logtype_default,
+                "aurp_send_ri_rsp: packet full, need multiple packets");
+            break;
+        }
+
+        if (firstnet == lastnet) {
+            /* Non-extended tuple (3 bytes) */
+            tmp = htons(firstnet);
+            memcpy(buf + len, &tmp, 2);
+            len += 2;
+            buf[len++] = dist;
+        } else {
+            /* Extended tuple (6 bytes) */
+            tmp = htons(firstnet);
+            memcpy(buf + len, &tmp, 2);
+            len += 2;
+            buf[len++] = dist | 0x80;  /* Extended flag */
+            tmp = htons(lastnet);
+            memcpy(buf + len, &tmp, 2);
+            len += 2;
+            buf[len++] = 0x00;  /* Reserved */
+        }
+
+        LOG(log_debug, logtype_default,
+            "aurp_send_ri_rsp: adding network %u-%u dist %u",
+            firstnet, lastnet, dist);
+    }
+
+    /* Send packet */
+    if (aurp_send_packet(peer, buf, len) < 0) {
+        return -1;
+    }
+
+    /* Save for retransmission */
+    if (peer->ap_last_pkt) {
+        free(peer->ap_last_pkt);
+    }
+    peer->ap_last_pkt = malloc(len);
+    if (peer->ap_last_pkt) {
+        memcpy(peer->ap_last_pkt, buf, len);
+        peer->ap_last_pkt_len = len;
+    }
+
+    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
+
+    LOG(log_info, logtype_default, "aurp_send_ri_rsp: sent to %s (last=%d)",
+        inet_ntoa(peer->ap_addr), last);
+
     return 0;
 }
 
+/*
+ * RI-Ack - Send routing information acknowledgement
+ */
 int aurp_send_ri_ack(struct aurp_peer *peer, uint16_t flags)
 {
-    /* TODO: Implement in Phase 4 */
-    LOG(log_debug, logtype_default, "aurp_send_ri_ack: stub called");
+    char buf[256];
+    int len = 0;
+    int n;
+
+    /* Build header */
+    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
+                          peer->ap_local_seq, AURP_CMD_RI_ACK, flags);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Send packet */
+    if (aurp_send_packet(peer, buf, len) < 0) {
+        return -1;
+    }
+
+    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
+
+    LOG(log_debug, logtype_default, "aurp_send_ri_ack: sent to %s flags=0x%04x",
+        inet_ntoa(peer->ap_addr), flags);
+
     return 0;
 }
 
+/*
+ * RI-Upd - Send routing information update with pending events
+ */
 int aurp_send_ri_upd(struct aurp_peer *peer)
 {
-    /* TODO: Implement in Phase 4 */
-    LOG(log_debug, logtype_default, "aurp_send_ri_upd: stub called");
+    char buf[AURP_MAX_PKT_SIZE];
+    int len = 0;
+    int n, i;
+    uint16_t tmp;
+
+    if (peer->ap_pending_count == 0) {
+        return 0;  /* Nothing to send */
+    }
+
+    /* Build header */
+    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
+                          peer->ap_local_seq, AURP_CMD_RI_UPD, 0);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Build event tuples */
+    for (i = 0; i < peer->ap_pending_count && len + 6 < sizeof(buf); i++) {
+        struct aurp_event *evt = &peer->ap_pending[i];
+
+        buf[len++] = evt->ae_code;
+
+        if (evt->ae_code == AURP_EVT_NULL) {
+            continue;  /* Null event is just the code */
+        }
+
+        tmp = htons(evt->ae_firstnet);
+        memcpy(buf + len, &tmp, 2);
+        len += 2;
+
+        if (evt->ae_firstnet == evt->ae_lastnet) {
+            /* Non-extended tuple */
+            buf[len++] = evt->ae_distance;
+        } else {
+            /* Extended tuple */
+            buf[len++] = evt->ae_distance | 0x80;
+            tmp = htons(evt->ae_lastnet);
+            memcpy(buf + len, &tmp, 2);
+            len += 2;
+        }
+    }
+
+    /* Send packet */
+    if (aurp_send_packet(peer, buf, len) < 0) {
+        return -1;
+    }
+
+    /* Save for retransmission */
+    if (peer->ap_last_pkt) {
+        free(peer->ap_last_pkt);
+    }
+    peer->ap_last_pkt = malloc(len);
+    if (peer->ap_last_pkt) {
+        memcpy(peer->ap_last_pkt, buf, len);
+        peer->ap_last_pkt_len = len;
+    }
+
+    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
+    peer->ap_send_state = AURP_SEND_WAIT_RI_UPD_ACK;
+
+    LOG(log_info, logtype_default, "aurp_send_ri_upd: sent %d events to %s",
+        peer->ap_pending_count, inet_ntoa(peer->ap_addr));
+
+    /* Clear pending events */
+    peer->ap_pending_count = 0;
+
     return 0;
 }
 
+/*
+ * RD - Send Router Down notification
+ */
 int aurp_send_rd(struct aurp_peer *peer, int16_t error)
 {
-    /* TODO: Implement in Phase 4 */
-    LOG(log_debug, logtype_default, "aurp_send_rd: stub called");
+    char buf[256];
+    int len = 0;
+    int n;
+    int16_t error_net;
+
+    /* Build header */
+    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
+                          peer->ap_local_seq, AURP_CMD_RD, 0);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Error code (2 bytes, signed, big-endian) */
+    error_net = htons((uint16_t)error);
+    memcpy(buf + len, &error_net, 2);
+    len += 2;
+
+    /* Send packet */
+    if (aurp_send_packet(peer, buf, len) < 0) {
+        return -1;
+    }
+
+    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
+
+    LOG(log_info, logtype_default, "aurp_send_rd: sent to %s error=%d",
+        inet_ntoa(peer->ap_addr), error);
+
     return 0;
 }
 

@@ -62,6 +62,7 @@ struct rtmp_tuple {
 #define RTMPTAB_HASZONES	0x02
 #define RTMPTAB_EXTENDED	0x04
 #define RTMPTAB_ROUTE		0x08
+#define RTMPTAB_AURP		0x10	/* Route learned via AURP */
 
 #ifndef BSD4_4
 #define RTMP_ADD	SIOCADDRT
