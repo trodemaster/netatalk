@@ -1,158 +1,199 @@
-# Agent Build Instructions
+# Agent Build Instructions - Netatalk AURP Implementation
+
+## Project Overview
+
+This is the netatalk AppleTalk protocol suite, with AURP (AppleTalk Update-Based Routing Protocol) IP tunneling being implemented in the atalkd daemon.
 
 ## Project Setup
+
+### Prerequisites
 ```bash
-# Install dependencies (example for Node.js project)
-npm install
+# Install dependencies (Ubuntu/Debian)
+sudo apt-get install build-essential meson ninja-build libavahi-client-dev \
+    libacl1-dev libdb-dev libevent-dev libgcrypt20-dev libkrb5-dev \
+    libldap2-dev libpam0g-dev libssl-dev libtirpc-dev
 
-# Or for Python project
-pip install -r requirements.txt
+# Or for other systems, check INSTALL.md in the project root
+```
 
-# Or for Rust project  
-cargo build
+### Building the Project
+```bash
+# From project root (/Users/blake/Developer/netatalk)
+
+# Setup build directory
+meson setup build
+
+# Compile
+meson compile -C build
+
+# Install (optional, requires sudo)
+sudo meson install -C build
 ```
 
 ## Running Tests
 ```bash
-# Node.js
-npm test
+# Build tests (if available)
+meson test -C build
 
-# Python
-pytest
-
-# Rust
-cargo test
+# Specific atalkd testing
+# (Will be added as AURP implementation progresses)
 ```
 
-## Build Commands
-```bash
-# Production build
-npm run build
-# or
-cargo build --release
+## AURP Implementation Status
+
+### Phase 1: Foundation (COMPLETED)
+- [x] Created `etc/atalkd/aurp.h` - AURP structures, constants, and prototypes
+- [x] Created `etc/atalkd/aurp.c` - UDP socket handling and packet encoding/decoding
+- [x] Created `etc/atalkd/aurp_peer.c` - Peer state machine and route management
+- [x] Created `etc/atalkd/aurp_config.c` - Configuration parsing
+- [x] Updated `etc/atalkd/meson.build` - Added AURP source files to build
+
+### Phase 2: Integration (IN PROGRESS)
+- [ ] Integrate AURP into main.c select() loop
+- [ ] Add AURP configuration parsing integration to config.c readconf()
+- [ ] Test compilation and fix any build errors
+- [ ] Initialize AURP on daemon startup
+
+### Phase 3: Testing (PENDING)
+- [ ] Basic UDP packet send/receive testing
+- [ ] Peer connection establishment testing
+- [ ] Open-Req/Open-Rsp handshake testing
+- [ ] Tickle/Tickle-Ack keepalive testing
+
+### Phase 4: Route Exchange (PENDING - Per requirements.md)
+- [ ] Implement RI-Rsp packet building with routing tuples
+- [ ] Implement RI-Rsp packet parsing and route installation
+- [ ] Implement RI-Upd for incremental updates
+- [ ] Integrate with rtmp.c route table
+- [ ] Test route learning from AURP peers
+
+### Phase 5: Zone Information (PENDING - Per requirements.md)
+- [ ] Implement ZI-Req/ZI-Rsp packet handling
+- [ ] Integrate with zip.c zone management
+- [ ] Test zone information exchange
+
+### Phase 6: Data Forwarding (PENDING - Per requirements.md)
+- [ ] Implement DDP packet encapsulation
+- [ ] Route encapsulated packets to local interfaces
+- [ ] Test end-to-end AppleTalk connectivity
+
+## Configuration Format
+
+AURP configuration is added to `/etc/atalkd.conf` (or configured location):
+
+```conf
+# Existing interface configuration (unchanged)
+eth0 -seed -phase 2 -net 100-100 -addr 100.1 -zone "My Zone"
+
+# AURP global configuration (new)
+aurp-listen 0.0.0.0          # IP address to bind UDP socket (default: 0.0.0.0)
+aurp-port 387                 # UDP port number (default: 387)
+aurp-open-peering no          # Accept connections from unknown peers (default: no)
+
+# AURP peers (can specify multiple)
+aurp-peer 192.168.1.100       # By IP address
+aurp-peer router.example.com  # By hostname
+aurp-peer 10.0.0.1            # Another peer
 ```
 
-## Development Server
-```bash
-# Start development server
-npm run dev
-# or
-cargo run
-```
+## Key Implementation Files
+
+### Core AURP Files (New)
+- `etc/atalkd/aurp.h` - Header with structures and constants (RFC 1504 compliant)
+- `etc/atalkd/aurp.c` - UDP socket, packet encoding/decoding (~600 lines)
+- `etc/atalkd/aurp_peer.c` - Peer state machine (~700 lines)
+- `etc/atalkd/aurp_config.c` - Configuration parsing (~180 lines)
+
+### Integration Points (To Be Modified)
+- `etc/atalkd/main.c` - Add AURP to main select() loop and timer
+- `etc/atalkd/config.c` - Integrate AURP config parsing
+- `etc/atalkd/rtmp.c` - Route table integration (Phase 4)
+- `etc/atalkd/zip.c` - Zone information integration (Phase 5)
+
+## Known Build Issues
+
+None currently - initial compilation not yet tested.
+
+## Development Workflow
+
+1. Make code changes
+2. Recompile: `meson compile -C build`
+3. Test functionality
+4. Commit working changes with descriptive messages
+5. Update @fix_plan.md with progress
 
 ## Key Learnings
-- Update this section when you learn new build optimizations
-- Document any gotchas or special setup requirements
-- Keep track of the fastest test/build cycle
 
-## Feature Development Quality Standards
+### AURP Protocol Notes
+- Sequence numbers: Must never be 0, use 1-65535
+- Connection IDs: Must never be 0, randomly generated
+- Timer intervals: Tickle every 10s, timeout after 90s
+- Retry limits: 5 retries for sends, 10 for tickles
+- Domain identifiers: NULL (0x00) or IP (0x01, 4 bytes)
 
-**CRITICAL**: All new features MUST meet the following mandatory requirements before being considered complete.
+### Netatalk atalkd Architecture
+- Main loop: `select()` based with `fd_set`
+- Timer: 10-second SIGALRM handler (`as_timer()`)
+- Protocols: RTMP (port 1), NBP (port 2), AEP (port 4), ZIP (port 6)
+- AURP will use separate UDP socket (not AppleTalk socket)
 
-### Testing Requirements
+### Integration Pattern
+- AURP socket added to main select() fd_set
+- `aurp_input()` called when socket readable
+- `aurp_timer()` called from main timer handler
+- `aurp_shutdown()` called on daemon exit
 
-- **Minimum Coverage**: 85% code coverage ratio required for all new code
-- **Test Pass Rate**: 100% - all tests must pass, no exceptions
-- **Test Types Required**:
-  - Unit tests for all business logic and services
-  - Integration tests for API endpoints or main functionality
-  - End-to-end tests for critical user workflows
-- **Coverage Validation**: Run coverage reports before marking features complete:
-  ```bash
-  # Examples by language/framework
-  npm run test:coverage
-  pytest --cov=src tests/ --cov-report=term-missing
-  cargo tarpaulin --out Html
-  ```
-- **Test Quality**: Tests must validate behavior, not just achieve coverage metrics
-- **Test Documentation**: Complex test scenarios must include comments explaining the test strategy
+## Reference Documentation
 
-### Git Workflow Requirements
+- RFC 1504: AppleTalk Update-Based Routing Protocol
+- specs/requirements.md: Full implementation plan
+- jrouter source: /Users/blake/code/jrouter (Go reference implementation)
+- Inside AppleTalk, Second Edition (Apple Computer)
 
-Before moving to the next feature, ALL changes must be:
+## Testing Strategy
 
-1. **Committed with Clear Messages**:
-   ```bash
-   git add .
-   git commit -m "feat(module): descriptive message following conventional commits"
-   ```
-   - Use conventional commit format: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, etc.
-   - Include scope when applicable: `feat(api):`, `fix(ui):`, `test(auth):`
-   - Write descriptive messages that explain WHAT changed and WHY
+### Unit Testing
+- Packet encoding/decoding correctness
+- Sequence number arithmetic
+- Domain identifier parsing
 
-2. **Pushed to Remote Repository**:
-   ```bash
-   git push origin <branch-name>
-   ```
-   - Never leave completed features uncommitted
-   - Push regularly to maintain backup and enable collaboration
-   - Ensure CI/CD pipelines pass before considering feature complete
+### Integration Testing
+- UDP socket communication
+- Peer connection establishment
+- Route propagation
+- Zone information exchange
+- Reconnection after failures
 
-3. **Branch Hygiene**:
-   - Work on feature branches, never directly on `main`
-   - Branch naming convention: `feature/<feature-name>`, `fix/<issue-name>`, `docs/<doc-update>`
-   - Create pull requests for all significant changes
+### System Testing
+- Multi-peer scenarios
+- Mixed seed/non-seed configurations
+- Network failure recovery
+- Performance under load
 
-4. **Ralph Integration**:
-   - Update @fix_plan.md with new tasks before starting work
-   - Mark items complete in @fix_plan.md upon completion
-   - Update PROMPT.md if development patterns change
-   - Test features work within Ralph's autonomous loop
+## Next Steps
 
-### Documentation Requirements
+1. Complete main.c integration (add AURP socket to select loop)
+2. Complete config.c integration (parse AURP directives)
+3. Run first compilation test
+4. Fix any compilation errors
+5. Test basic AURP initialization
+6. Move to Phase 4 (Route Exchange) implementation
 
-**ALL implementation documentation MUST remain synchronized with the codebase**:
+## Commit Guidelines
 
-1. **Code Documentation**:
-   - Language-appropriate documentation (JSDoc, docstrings, etc.)
-   - Update inline comments when implementation changes
-   - Remove outdated comments immediately
+Use conventional commit format:
+- `feat(aurp):` - New AURP features
+- `fix(aurp):` - Bug fixes in AURP code
+- `test(aurp):` - AURP testing additions
+- `docs(aurp):` - AURP documentation updates
+- `refactor(aurp):` - AURP code refactoring
 
-2. **Implementation Documentation**:
-   - Update relevant sections in this AGENT.md file
-   - Keep build and test commands current
-   - Update configuration examples when defaults change
-   - Document breaking changes prominently
+Example: `feat(aurp): implement Open-Req/Open-Rsp handshake`
 
-3. **README Updates**:
-   - Keep feature lists current
-   - Update setup instructions when dependencies change
-   - Maintain accurate command examples
-   - Update version compatibility information
+## Ralph Integration Notes
 
-4. **AGENT.md Maintenance**:
-   - Add new build patterns to relevant sections
-   - Update "Key Learnings" with new insights
-   - Keep command examples accurate and tested
-   - Document new testing patterns or quality gates
-
-### Feature Completion Checklist
-
-Before marking ANY feature as complete, verify:
-
-- [ ] All tests pass with appropriate framework command
-- [ ] Code coverage meets 85% minimum threshold
-- [ ] Coverage report reviewed for meaningful test quality
-- [ ] Code formatted according to project standards
-- [ ] Type checking passes (if applicable)
-- [ ] All changes committed with conventional commit messages
-- [ ] All commits pushed to remote repository
-- [ ] @fix_plan.md task marked as complete
-- [ ] Implementation documentation updated
-- [ ] Inline code comments updated or added
-- [ ] AGENT.md updated (if new patterns introduced)
-- [ ] Breaking changes documented
-- [ ] Features tested within Ralph loop (if applicable)
-- [ ] CI/CD pipeline passes
-
-### Rationale
-
-These standards ensure:
-- **Quality**: High test coverage and pass rates prevent regressions
-- **Traceability**: Git commits and @fix_plan.md provide clear history of changes
-- **Maintainability**: Current documentation reduces onboarding time and prevents knowledge loss
-- **Collaboration**: Pushed changes enable team visibility and code review
-- **Reliability**: Consistent quality gates maintain production stability
-- **Automation**: Ralph integration ensures continuous development practices
-
-**Enforcement**: AI agents should automatically apply these standards to all feature development tasks without requiring explicit instruction for each task.
+- This implementation is designed to work with Ralph autonomous agent
+- Each phase is a manageable unit of work
+- Stub functions allow incremental implementation
+- Extensive logging for debugging and monitoring
+- Clear separation of concerns for maintainability

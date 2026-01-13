@@ -1,5 +1,8 @@
 atalkd_sources = [
     'aep.c',
+    'aurp.c',
+    'aurp_config.c',
+    'aurp_peer.c',
     'config.c',
     'main.c',
     'multicast.c',
