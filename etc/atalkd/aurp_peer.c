@@ -23,6 +23,8 @@
 
 #include "aurp.h"
 #include "rtmp.h"
+#include "zip.h"
+#include "list.h"
 
 /* Generate random connection ID */
 static uint16_t aurp_generate_conn_id(void)
@@ -79,6 +81,11 @@ struct aurp_peer *aurp_peer_new(struct in_addr addr, const char *hostname)
     /* Initialize route list */
     peer->ap_routes = NULL;
 
+    /* Initialize zone request queue */
+    peer->ap_zi_pending = NULL;
+    peer->ap_zi_pending_count = 0;
+    peer->ap_zi_pending_alloc = 0;
+
     /* Initialize packet buffer */
     peer->ap_last_pkt = NULL;
     peer->ap_last_pkt_len = 0;
@@ -107,6 +114,10 @@ void aurp_peer_free(struct aurp_peer *peer)
 
     if (peer->ap_pending) {
         free(peer->ap_pending);
+    }
+
+    if (peer->ap_zi_pending) {
+        free(peer->ap_zi_pending);
     }
 
     if (peer->ap_last_pkt) {
@@ -444,6 +455,9 @@ void aurp_handle_ri_req(struct aurp_peer *peer, char *data, int len)
 
     /* Send routing information response */
     aurp_send_ri_rsp(peer, 1);  /* 1 = last packet */
+
+    /* Move to waiting for RI-Ack state */
+    peer->ap_send_state = AURP_SEND_WAIT_RI_RSP_ACK;
 }
 
 /* Handle RI-Rsp - parse network tuples and store routes */
@@ -500,21 +514,65 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
         "aurp_handle_ri_rsp: learned %d routes from %s",
         count, inet_ntoa(peer->ap_addr));
 
-    /* Move to connected state and send acknowledgement */
+    /* Send acknowledgement with SZI flag to request zone information */
     if (peer->ap_recv_state == AURP_RECV_WAIT_RI_RSP) {
-        peer->ap_recv_state = AURP_RECV_CONNECTED;
-        aurp_send_ri_ack(peer, 0);
-        LOG(log_info, logtype_default,
-            "aurp_handle_ri_rsp: connection fully established with %s",
-            inet_ntoa(peer->ap_addr));
+        /* Send RI-Ack with SZI flag to request zone info */
+        aurp_send_ri_ack(peer, AURP_FLAG_SZI);
+
+        /* Collect networks that need zones */
+        if (count > 0) {
+            struct rtmptab *rt;
+            uint16_t *nets;
+            int net_count = 0;
+
+            /* Allocate array for networks */
+            nets = malloc(count * sizeof(uint16_t));
+            if (nets != NULL) {
+                for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
+                    if ((rt->rt_flags & RTMPTAB_HASZONES) == 0) {
+                        nets[net_count++] = ntohs(rt->rt_firstnet);
+                    }
+                }
+
+                if (net_count > 0) {
+                    /* Save pending zone requests */
+                    peer->ap_zi_pending = nets;
+                    peer->ap_zi_pending_count = net_count;
+                    peer->ap_zi_pending_alloc = count;
+
+                    /* Request zone information */
+                    aurp_send_zi_req(peer, nets, net_count);
+                    peer->ap_recv_state = AURP_RECV_WAIT_ZI_RSP;
+                    LOG(log_info, logtype_default,
+                        "aurp_handle_ri_rsp: requesting zones for %d networks from %s",
+                        net_count, inet_ntoa(peer->ap_addr));
+                } else {
+                    free(nets);
+                    peer->ap_recv_state = AURP_RECV_CONNECTED;
+                    LOG(log_info, logtype_default,
+                        "aurp_handle_ri_rsp: connection fully established with %s (no zones needed)",
+                        inet_ntoa(peer->ap_addr));
+                }
+            } else {
+                /* Malloc failed, just connect without zones */
+                peer->ap_recv_state = AURP_RECV_CONNECTED;
+                LOG(log_warning, logtype_default,
+                    "aurp_handle_ri_rsp: malloc failed, connecting without zones");
+            }
+        } else {
+            peer->ap_recv_state = AURP_RECV_CONNECTED;
+            LOG(log_info, logtype_default,
+                "aurp_handle_ri_rsp: connection fully established with %s (no routes)",
+                inet_ntoa(peer->ap_addr));
+        }
     }
 }
 
 /* Handle RI-Ack */
 void aurp_handle_ri_ack(struct aurp_peer *peer, char *data, int len)
 {
-    LOG(log_debug, logtype_default, "aurp_handle_ri_ack: from %s",
-        inet_ntoa(peer->ap_addr));
+    LOG(log_debug, logtype_default, "aurp_handle_ri_ack: from %s flags=0x%04x",
+        inet_ntoa(peer->ap_addr), peer->ap_last_recv_flags);
 
     /* Clear pending retransmission */
     if (peer->ap_last_pkt) {
@@ -523,6 +581,28 @@ void aurp_handle_ri_ack(struct aurp_peer *peer, char *data, int len)
         peer->ap_last_pkt_len = 0;
     }
     peer->ap_send_retries = 0;
+
+    /* If we're in SEND state waiting for RI-Rsp Ack, transition to connected */
+    if (peer->ap_send_state == AURP_SEND_WAIT_RI_RSP_ACK) {
+        peer->ap_send_state = AURP_SEND_CONNECTED;
+        LOG(log_debug, logtype_default,
+            "aurp_handle_ri_ack: sender now connected to %s",
+            inet_ntoa(peer->ap_addr));
+
+        /* If SZI flag is set, peer wants zone information */
+        if (peer->ap_last_recv_flags & AURP_FLAG_SZI) {
+            LOG(log_info, logtype_default,
+                "aurp_handle_ri_ack: peer %s requested zone info (SZI flag)",
+                inet_ntoa(peer->ap_addr));
+            aurp_send_zi_rsp(peer, 1);  /* Send all our zones */
+        }
+    }
+
+    /* If we're waiting for RI-Upd Ack, transition back to connected */
+    if (peer->ap_send_state == AURP_SEND_WAIT_RI_UPD_ACK) {
+        peer->ap_send_state = AURP_SEND_CONNECTED;
+        aurp_flush_events(peer);  /* Clear processed events */
+    }
 }
 
 /* Handle RI-Upd - parse event tuples and update routes */
@@ -660,20 +740,151 @@ void aurp_handle_tickle_ack(struct aurp_peer *peer)
     }
 }
 
-/* Handle ZI-Req (stub) */
+/* Handle ZI-Req - respond with zone information for requested networks */
 void aurp_handle_zi_req(struct aurp_peer *peer, char *data, int len)
 {
-    LOG(log_debug, logtype_default, "aurp_handle_zi_req: from %s (stub)",
-        inet_ntoa(peer->ap_addr));
-    /* TODO: Implement in Phase 5 */
+    uint16_t subcode;
+    int count;
+
+    LOG(log_info, logtype_default, "aurp_handle_zi_req: from %s len=%d",
+        inet_ntoa(peer->ap_addr), len);
+
+    /* Parse subcode (2 bytes) */
+    if (len < 2) {
+        LOG(log_warning, logtype_default,
+            "aurp_handle_zi_req: packet too short for subcode");
+        return;
+    }
+    memcpy(&subcode, data, 2);
+    subcode = ntohs(subcode);
+    data += 2;
+    len -= 2;
+
+    if (subcode != AURP_SUBCODE_ZI_REQ) {
+        LOG(log_warning, logtype_default,
+            "aurp_handle_zi_req: unsupported subcode 0x%04x", subcode);
+        return;
+    }
+
+    /* Count requested networks */
+    count = len / 2;
+    LOG(log_debug, logtype_default,
+        "aurp_handle_zi_req: peer requesting zones for %d networks", count);
+
+    /* For now, just send all our zones - a more complete implementation
+     * would filter to only requested networks */
+    aurp_send_zi_rsp(peer, 1);  /* 1 = last packet */
 }
 
-/* Handle ZI-Rsp (stub) */
+/* Handle ZI-Rsp - parse zone tuples and add zones to routes */
 void aurp_handle_zi_rsp(struct aurp_peer *peer, char *data, int len)
 {
-    LOG(log_debug, logtype_default, "aurp_handle_zi_rsp: from %s (stub)",
-        inet_ntoa(peer->ap_addr));
-    /* TODO: Implement in Phase 5 */
+    uint16_t subcode, zone_count, network;
+    int i, zone_len;
+    char zone_name[33];
+    struct rtmptab *rt;
+    int zones_added = 0;
+
+    LOG(log_info, logtype_default, "aurp_handle_zi_rsp: from %s len=%d",
+        inet_ntoa(peer->ap_addr), len);
+
+    /* Parse subcode (2 bytes) */
+    if (len < 4) {
+        LOG(log_warning, logtype_default,
+            "aurp_handle_zi_rsp: packet too short");
+        return;
+    }
+    memcpy(&subcode, data, 2);
+    subcode = ntohs(subcode);
+    data += 2;
+    len -= 2;
+
+    /* Parse zone count (2 bytes) */
+    memcpy(&zone_count, data, 2);
+    zone_count = ntohs(zone_count);
+    data += 2;
+    len -= 2;
+
+    LOG(log_debug, logtype_default,
+        "aurp_handle_zi_rsp: subcode=0x%04x zone_count=%u",
+        subcode, zone_count);
+
+    /* Parse zone tuples */
+    for (i = 0; i < zone_count && len >= 3; i++) {
+        /* Network number (2 bytes) */
+        memcpy(&network, data, 2);
+        network = ntohs(network);
+        data += 2;
+        len -= 2;
+
+        /* Check for optimized tuple (high bit set in first byte) */
+        if ((uint8_t)*data & 0x80) {
+            /* Optimized tuple - offset to zone name */
+            /* Skip for now - would need to track first zone names */
+            LOG(log_debug, logtype_default,
+                "aurp_handle_zi_rsp: skipping optimized tuple for net %u",
+                network);
+            data += 2;
+            len -= 2;
+            continue;
+        }
+
+        /* Long tuple - zone name length (1 byte) + name */
+        zone_len = (uint8_t)*data++;
+        len--;
+
+        if (zone_len > 32 || zone_len > len) {
+            LOG(log_warning, logtype_default,
+                "aurp_handle_zi_rsp: invalid zone length %d", zone_len);
+            break;
+        }
+
+        memcpy(zone_name, data, zone_len);
+        zone_name[zone_len] = '\0';
+        data += zone_len;
+        len -= zone_len;
+
+        LOG(log_info, logtype_default,
+            "aurp_handle_zi_rsp: network %u zone '%s'",
+            network, zone_name);
+
+        /* Find the route for this network in peer's route list */
+        for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
+            uint16_t rt_firstnet = ntohs(rt->rt_firstnet);
+            uint16_t rt_lastnet = ntohs(rt->rt_lastnet);
+
+            if (network >= rt_firstnet && network <= rt_lastnet) {
+                /* Add zone to this route */
+                if (addzone(rt, zone_len, zone_name) == 0) {
+                    rt->rt_flags |= RTMPTAB_HASZONES;
+                    zones_added++;
+                    LOG(log_debug, logtype_default,
+                        "aurp_handle_zi_rsp: added zone '%s' to route %u-%u",
+                        zone_name, rt_firstnet, rt_lastnet);
+                }
+                break;
+            }
+        }
+    }
+
+    LOG(log_info, logtype_default,
+        "aurp_handle_zi_rsp: added %d zones from %s",
+        zones_added, inet_ntoa(peer->ap_addr));
+
+    /* Clear pending zone requests and return to connected state */
+    if (peer->ap_zi_pending) {
+        free(peer->ap_zi_pending);
+        peer->ap_zi_pending = NULL;
+    }
+    peer->ap_zi_pending_count = 0;
+    peer->ap_zi_pending_alloc = 0;
+
+    if (peer->ap_recv_state == AURP_RECV_WAIT_ZI_RSP) {
+        peer->ap_recv_state = AURP_RECV_CONNECTED;
+        LOG(log_info, logtype_default,
+            "aurp_handle_zi_rsp: connection fully established with zones from %s",
+            inet_ntoa(peer->ap_addr));
+    }
 }
 
 /*

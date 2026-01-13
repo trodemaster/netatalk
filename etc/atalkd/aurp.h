@@ -66,6 +66,13 @@
 #define AURP_ERR_INSUFFICIENT_RES   -6
 #define AURP_ERR_AUTHENTICATION     -7
 
+/* ZI-Req/ZI-Rsp Subcodes */
+#define AURP_SUBCODE_ZI_REQ         0x0001  /* Zone Info Request */
+#define AURP_SUBCODE_ZI_NONEXT      0x0001  /* Zone Info Non-Extended Response */
+#define AURP_SUBCODE_ZI_EXT         0x0002  /* Zone Info Extended Response */
+#define AURP_SUBCODE_GZN            0x0003  /* Get Zones Net */
+#define AURP_SUBCODE_GDZL           0x0004  /* Get Domain Zone List */
+
 /* Timer constants (seconds) */
 #define AURP_LAST_HEARD_TIMER     90
 #define AURP_SEND_RETRY_TIMER     10
@@ -90,6 +97,7 @@ typedef enum {
     AURP_RECV_UNCONNECTED = 0,
     AURP_RECV_WAIT_OPEN_RSP,
     AURP_RECV_WAIT_RI_RSP,
+    AURP_RECV_WAIT_ZI_RSP,
     AURP_RECV_CONNECTED,
     AURP_RECV_WAIT_TICKLE_ACK
 } aurp_recv_state_t;
@@ -156,9 +164,17 @@ struct aurp_peer {
     /* Routes learned from this peer */
     struct rtmptab      *ap_routes;
 
+    /* Pending zone requests */
+    uint16_t            *ap_zi_pending;     /* Networks waiting for zones */
+    int                  ap_zi_pending_count;
+    int                  ap_zi_pending_alloc;
+
     /* Last sent packet (for retransmission) */
     char                *ap_last_pkt;
     int                  ap_last_pkt_len;
+
+    /* Last received packet flags (for handler use) */
+    uint16_t             ap_last_recv_flags;
 
     /* Flags */
     int                  ap_flags;

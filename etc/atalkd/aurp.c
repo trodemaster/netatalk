@@ -26,6 +26,8 @@
 #include "aurp.h"
 #include "rtmp.h"
 #include "interface.h"
+#include "zip.h"
+#include "list.h"
 
 /* Global AURP configuration */
 struct aurp_config aurp_config = {
@@ -282,6 +284,9 @@ void aurp_input(int fd)
         peer->ap_remote_conn_id = conn_id;
     }
     peer->ap_remote_seq = seq;
+
+    /* Store flags for handler use */
+    peer->ap_last_recv_flags = flags;
 
     /* Dispatch to appropriate handler */
     switch (cmd) {
@@ -786,17 +791,162 @@ int aurp_send_rd(struct aurp_peer *peer, int16_t error)
     return 0;
 }
 
+/*
+ * ZI-Req - Send zone information request for specific networks
+ */
 int aurp_send_zi_req(struct aurp_peer *peer, uint16_t *nets, int count)
 {
-    /* TODO: Implement in Phase 5 */
-    LOG(log_debug, logtype_default, "aurp_send_zi_req: stub called");
+    char buf[AURP_MAX_PKT_SIZE];
+    int len = 0;
+    int n, i;
+    uint16_t tmp;
+
+    if (count == 0) {
+        return 0;  /* Nothing to request */
+    }
+
+    /* Build header */
+    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
+                          peer->ap_local_seq, AURP_CMD_ZI_REQ, 0);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Subcode (2 bytes) */
+    tmp = htons(AURP_SUBCODE_ZI_REQ);
+    memcpy(buf + len, &tmp, 2);
+    len += 2;
+
+    /* Network numbers (2 bytes each) */
+    for (i = 0; i < count && len + 2 <= sizeof(buf); i++) {
+        tmp = htons(nets[i]);
+        memcpy(buf + len, &tmp, 2);
+        len += 2;
+    }
+
+    /* Send packet */
+    if (aurp_send_packet(peer, buf, len) < 0) {
+        return -1;
+    }
+
+    /* Save for retransmission */
+    if (peer->ap_last_pkt) {
+        free(peer->ap_last_pkt);
+    }
+    peer->ap_last_pkt = malloc(len);
+    if (peer->ap_last_pkt) {
+        memcpy(peer->ap_last_pkt, buf, len);
+        peer->ap_last_pkt_len = len;
+    }
+
+    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
+
+    LOG(log_info, logtype_default, "aurp_send_zi_req: sent request for %d networks to %s",
+        count, inet_ntoa(peer->ap_addr));
+
     return 0;
 }
 
+/*
+ * ZI-Rsp - Send zone information response
+ * Builds zone tuples from our local interfaces
+ */
 int aurp_send_zi_rsp(struct aurp_peer *peer, int last)
 {
-    /* TODO: Implement in Phase 5 */
-    LOG(log_debug, logtype_default, "aurp_send_zi_rsp: stub called");
+    char buf[AURP_MAX_PKT_SIZE];
+    int len = 0;
+    int n;
+    uint16_t flags = 0;
+    uint16_t tmp, zone_count = 0;
+    char *zone_count_ptr;
+    struct interface *iface;
+    struct list *l;
+    struct ziptab *zt;
+    extern struct interface *interfaces;
+
+    if (last) {
+        flags |= AURP_FLAG_LAST;
+    }
+
+    /* Build header */
+    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
+                          peer->ap_local_seq, AURP_CMD_ZI_RSP, flags);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Subcode (2 bytes) - use non-extended for simplicity */
+    tmp = htons(AURP_SUBCODE_ZI_NONEXT);
+    memcpy(buf + len, &tmp, 2);
+    len += 2;
+
+    /* Zone count placeholder (2 bytes) - we'll fill it in later */
+    zone_count_ptr = buf + len;
+    len += 2;
+
+    /* Build zone tuples from our local interfaces */
+    for (iface = interfaces; iface != NULL; iface = iface->i_next) {
+        uint16_t network;
+
+        /* Skip unconfigured interfaces */
+        if ((iface->i_flags & IFACE_CONFIG) == 0) {
+            continue;
+        }
+
+        /* Skip loopback */
+        if (iface->i_flags & IFACE_LOOPBACK) {
+            continue;
+        }
+
+        /* Skip interfaces without routes or zones */
+        if (iface->i_rt == NULL || iface->i_rt->rt_zt == NULL) {
+            continue;
+        }
+
+        network = ntohs(iface->i_rt->rt_firstnet);
+
+        /* Add zone tuples for each zone on this network */
+        for (l = iface->i_rt->rt_zt; l != NULL; l = l->l_next) {
+            zt = (struct ziptab *)l->l_data;
+
+            /* Check buffer space: network(2) + length(1) + name(n) */
+            if (len + 3 + zt->zt_len > sizeof(buf)) {
+                LOG(log_warning, logtype_default,
+                    "aurp_send_zi_rsp: packet full, need multiple packets");
+                goto send;
+            }
+
+            /* Network number (2 bytes) */
+            tmp = htons(network);
+            memcpy(buf + len, &tmp, 2);
+            len += 2;
+
+            /* Zone name length (1 byte) + name */
+            buf[len++] = zt->zt_len;
+            memcpy(buf + len, zt->zt_name, zt->zt_len);
+            len += zt->zt_len;
+
+            zone_count++;
+
+            LOG(log_debug, logtype_default,
+                "aurp_send_zi_rsp: adding zone '%.*s' for network %u",
+                zt->zt_len, zt->zt_name, network);
+        }
+    }
+
+send:
+    /* Fill in zone count */
+    tmp = htons(zone_count);
+    memcpy(zone_count_ptr, &tmp, 2);
+
+    /* Send packet */
+    if (aurp_send_packet(peer, buf, len) < 0) {
+        return -1;
+    }
+
+    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
+
+    LOG(log_info, logtype_default, "aurp_send_zi_rsp: sent %u zones to %s (last=%d)",
+        zone_count, inet_ntoa(peer->ap_addr), last);
+
     return 0;
 }
 

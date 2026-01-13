@@ -69,10 +69,11 @@ meson test -C build
 - [x] Added RTMPTAB_AURP flag for AURP-learned routes
 - [x] AURP service running and ready for peer connections
 
-### Phase 5: Zone Information (PENDING - Per requirements.md)
-- [ ] Implement ZI-Req/ZI-Rsp packet handling
-- [ ] Integrate with zip.c zone management
-- [ ] Test zone information exchange
+### Phase 5: Zone Information (COMPLETED)
+- [x] Implement ZI-Req/ZI-Rsp packet handling
+- [x] Integrate with zip.c zone management (addzone())
+- [x] Request zones after RI-Rsp using SZI flag
+- [x] Parse zone tuples and add to AURP-learned routes
 
 ### Phase 6: Data Forwarding (PENDING - Per requirements.md)
 - [ ] Implement DDP packet encapsulation
@@ -180,13 +181,13 @@ None - AURP integration compiles successfully (tested 2026-01-12).
 4. ~~Fix any compilation errors~~ DONE - No errors
 5. ~~Test basic AURP initialization with sample config file~~ DONE - Working on 192.168.0.214:387
 6. ~~Phase 4 (Route Exchange) implementation~~ DONE
-   - ~~Implement RI-Rsp packet building with routing tuples~~
-   - ~~Implement RI-Rsp parsing and route installation~~
-   - ~~Implement route management functions~~
-7. Test AURP peer connections when peers become available
-8. Move to Phase 5 (Zone Information) implementation
-   - Implement ZI-Req/ZI-Rsp packet handling
-   - Integrate with zip.c zone management
+7. ~~Phase 5 (Zone Information) implementation~~ DONE
+   - ~~Implement ZI-Req/ZI-Rsp packet handling~~
+   - ~~Integrate with zip.c zone management~~
+8. Test AURP peer connections when peers become available
+9. Move to Phase 6 (Data Forwarding) implementation
+   - Implement DDP packet encapsulation (AURP packet type 0x0002)
+   - Route encapsulated packets to local interfaces
 
 ## Commit Guidelines
 

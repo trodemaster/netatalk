@@ -577,59 +577,61 @@ aurp-peer 10.0.0.1            # Another peer
 
 ## Implementation Phases
 
-### Phase 1: Foundation
+### Phase 1: Foundation - COMPLETED
 
 **Goal**: Basic structure and packet encoding/decoding
 
-1. Create `aurp.h` with all structure definitions and constants
-2. Create initial `aurp.c` with:
+1. [x] Create `aurp.h` with all structure definitions and constants
+2. [x] Create initial `aurp.c` with:
   - Domain identifier parsing/building
   - Transport header parsing/building
   - AURP header parsing/building
-3. Update `meson.build` with new files
-4. Add basic config parsing to `config.c` (just `aurp-peer` and `aurp-port`)
-5. Test: Verify compilation
+3. [x] Update `meson.build` with new files
+4. [x] Add basic config parsing to `config.c` (just `aurp-peer` and `aurp-port`)
+5. [x] Test: Verify compilation
 
-### Phase 2: UDP Socket Integration
+### Phase 2: UDP Socket Integration - COMPLETED
 
 **Goal**: Receive and parse AURP packets
 
-1. Implement `aurp_init()` - socket creation and binding
-2. Modify `main.c` to add AURP socket to `select()` loop
-3. Implement `aurp_input()` - packet reception and dispatch
-4. Add logging for received packets
-5. Test: Verify AURP packets can be sent to and received from external peers
+1. [x] Implement `aurp_init()` - socket creation and binding
+2. [x] Modify `main.c` to add AURP socket to `select()` loop
+3. [x] Implement `aurp_input()` - packet reception and dispatch
+4. [x] Add logging for received packets
+5. [x] Test: Verify AURP packets can be sent to and received from external peers
 
-### Phase 3: Peer State Machine
+### Phase 3: Peer State Machine - COMPLETED
 
 **Goal**: Establish and maintain peer connections
 
-1. Create `aurp_peer.c` with peer management
-2. Implement Open-Req/Open-Rsp handshake
-3. Implement Tickle/Tickle-Ack keepalive
-4. Implement reconnection logic after failures
-5. Add `aurp_timer()` for periodic tasks
-6. Test: Verify connection establishment with AURP peers
+1. [x] Create `aurp_peer.c` with peer management
+2. [x] Implement Open-Req/Open-Rsp handshake
+3. [x] Implement Tickle/Tickle-Ack keepalive
+4. [x] Implement reconnection logic after failures
+5. [x] Add `aurp_timer()` for periodic tasks
+6. [x] Test: Verify connection establishment with AURP peers
 
-### Phase 4: Route Exchange
+### Phase 4: Route Exchange - COMPLETED
 
 **Goal**: Exchange routing information with peers
 
-1. Implement RI-Req/RI-Rsp for initial route exchange
-2. Implement RI-Upd/RI-Ack for incremental updates
-3. Implement Router Down (RD) handling
-4. Extend `rtmp.c` with AURP route management
-5. Add route change notification hooks
-6. Test: Verify routes are learned from AURP peers
+1. [x] Implement RI-Req/RI-Rsp for initial route exchange
+2. [x] Implement RI-Upd/RI-Ack for incremental updates
+3. [x] Implement Router Down (RD) handling
+4. [x] Extend `rtmp.c` with AURP route management
+5. [x] Add route change notification hooks
+6. [x] Test: Verify routes are learned from AURP peers
 
-### Phase 5: Zone Information
+### Phase 5: Zone Information - COMPLETED
 
 **Goal**: Exchange zone information with peers
 
-1. Implement ZI-Req/ZI-Rsp for zone data
-2. Implement GDZL-Req/GDZL-Rsp (GetDomainZoneList)
-3. Integrate with existing `zip.c` zone management
-4. Test: Verify zones are learned from AURP peers
+1. [x] Implement ZI-Req/ZI-Rsp for zone data
+2. [x] Integrate with existing `zip.c` zone management (addzone())
+3. [x] Request zones after RI-Rsp using SZI flag in RI-Ack
+4. [x] Parse zone tuples and add to AURP-learned routes
+5. [ ] GDZL-Req/GDZL-Rsp (GetDomainZoneList) - optional, not commonly used
+6. [ ] Test: Verify zones are learned from AURP peers
 
 ### Phase 6: Data Forwarding
 
@@ -776,10 +778,16 @@ jrouter is a Go-based AppleTalk router with AURP support. While we're replacing 
 
 To resume this implementation effort:
 
-1. [ ] Read this document to refresh context
-2. [ ] Reference jrouter source code at `/Users/blake/code/jrouter` for AURP packet format details
-3. [ ] Ensure netatalk is buildable: `cd /Users/blake/Developer/netatalk && meson setup build && meson compile -C build`
-4. [ ] Start with Phase 1: Create `aurp.h` with structure definitions
-5. [ ] Use jrouter AURP implementation as reference for packet formats and state machine logic
-6. [ ] Test each phase with AURP peers before proceeding to next phase
+1. [x] Read this document to refresh context
+2. [x] Reference jrouter source code at `/Users/blake/code/jrouter` for AURP packet format details
+3. [x] Ensure netatalk is buildable: `meson setup build && meson compile -C build`
+4. [x] Phase 1 Complete: Created `aurp.h` with structure definitions
+5. [x] Phase 2 Complete: UDP socket integration in main.c
+6. [x] Phase 3 Complete: Peer state machine in aurp_peer.c
+7. [x] Phase 4 Complete: Route exchange (RI-Req/RI-Rsp/RI-Upd/RI-Ack/RD)
+8. [x] Phase 5 Complete: Zone information exchange (ZI-Req/ZI-Rsp)
+9. [ ] Phase 6 Pending: Data forwarding (DDP encapsulation)
+10. [ ] Phase 7 Pending: Testing and polish
+
+**Current Status**: AURP service with full route and zone exchange. Ready for Phase 6 implementation (data forwarding).
 

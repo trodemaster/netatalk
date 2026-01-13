@@ -19,8 +19,8 @@
 
 ## Low Priority
 
-- [ ] Implement zone information exchange (Phase 5 - aurp_zip.c)
-- [ ] Implement ZI-Req/ZI-Rsp packet handling
+- [x] Implement zone information exchange (Phase 5)
+- [x] Implement ZI-Req/ZI-Rsp packet handling
 - [ ] Implement DDP packet encapsulation for data forwarding (Phase 6)
 - [ ] Add comprehensive error recovery mechanisms
 - [ ] Performance optimization and stress testing
@@ -37,7 +37,7 @@
 
 ## Implementation Notes
 
-### Current Phase: Phase 4 - Route Exchange (COMPLETED)
+### Current Phase: Phase 5 - Zone Information (COMPLETED)
 
 **Completed in Phase 1:**
 1. AURP header file with complete RFC 1504 structures
@@ -75,10 +75,19 @@
 8. Added RTMPTAB_AURP flag for AURP-learned routes
 9. AURP service running with full routing protocol support
 
-**Next Steps (Phase 5 - Zone Information):**
-1. Implement ZI-Req/ZI-Rsp packet handling
-2. Integrate with zip.c zone management
-3. Test zone information exchange with AURP peers
+**Completed in Phase 5:**
+1. Implemented ZI-Req handling - responds with zone info for requested networks
+2. Implemented ZI-Rsp handling - parses zone tuples and adds to routes
+3. Integrated with zip.c zone management via addzone()
+4. Request zones after RI-Rsp using SZI flag in RI-Ack
+5. Added AURP_RECV_WAIT_ZI_RSP state for zone info exchange
+6. Zone tuples parsed with support for long tuples (optimized tuples logged but skipped)
+
+**Next Steps (Phase 6 - Data Forwarding):**
+1. Implement DDP packet encapsulation (AURP packet type 0x0002)
+2. Route encapsulated packets to local interfaces
+3. Encapsulate outbound packets for AURP peers
+4. Handle NBP FwdReq for cross-tunnel name lookups
 
 ### Key Technical Decisions
 
@@ -158,5 +167,5 @@ atalkd (main daemon)
 ---
 
 **Last Updated**: 2026-01-13
-**Current Status**: Phases 1-4 complete - AURP route exchange implemented and running
-**Next Priority**: Phase 5 (Zone Information) - implement ZI-Req/ZI-Rsp handling
+**Current Status**: Phases 1-5 complete - AURP zone information exchange implemented
+**Next Priority**: Phase 6 (Data Forwarding) - implement DDP packet encapsulation
