@@ -40,6 +40,7 @@
 #include "zip.h"
 #include "list.h"
 #include "main.h"
+#include "aurp.h"
 
 #ifndef IFF_SLAVE /* a little backward compatibility */
 #define IFF_SLAVE 0
@@ -357,6 +358,17 @@ int readconf(char *cf)
 
     while (fgets(line, sizeof(line), conf) != NULL) {
         if ((argv = at_parseline(line)) == NULL) {
+            continue;
+        }
+
+        /* Check for AURP configuration directives */
+        if (strncmp(argv[0], "aurp-", 5) == 0) {
+            if (aurp_config_parse(argv) < 0) {
+                fprintf(stderr, "AURP configuration error: %s\n", argv[0]);
+                freeline(argv);
+                goto read_conf_err;
+            }
+            freeline(argv);
             continue;
         }
 

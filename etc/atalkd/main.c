@@ -54,6 +54,7 @@
 #include "nbp.h"
 #include "atserv.h"
 #include "main.h"
+#include "aurp.h"
 
 /* Forward Declarations */
 int ifconfig(const char *iname, unsigned long cmd, struct sockaddr_at *sa);
@@ -684,6 +685,11 @@ static void as_timer(int sig _U_)
     if (debug) {
         consistency();
     }
+
+    /* Process AURP timers if enabled */
+    if (aurp_config.ac_enabled) {
+        aurp_timer();
+    }
 }
 
 /*
@@ -883,6 +889,11 @@ as_down(int sig _U_)
                     strerror(errno));
             }
         }
+    }
+
+    /* Shutdown AURP if enabled */
+    if (aurp_config.ac_enabled) {
+        aurp_shutdown();
     }
 
     LOG(log_info, logtype_atalkd, "done");
@@ -1221,6 +1232,23 @@ int main(int ac, char **av)
     sigaddset(&signal_set, SIGALRM);
     sigaddset(&signal_set, SIGUSR1);
 
+    /* Initialize AURP if configured */
+    if (aurp_config.ac_enabled) {
+        if (aurp_init(&aurp_config) >= 0) {
+            LOG(log_info, logtype_atalkd, "AURP enabled on port %d",
+                aurp_config.ac_port);
+            /* Add AURP socket to select set */
+            if (aurp_fd >= 0) {
+                FD_SET(aurp_fd, &fds);
+                if (aurp_fd >= nfds) {
+                    nfds = aurp_fd + 1;
+                }
+            }
+        } else {
+            LOG(log_error, logtype_atalkd, "AURP initialization failed");
+        }
+    }
+
     for (;;) {
         readfds = fds;
 
@@ -1274,6 +1302,21 @@ int main(int ac, char **av)
                         }
                     }
                 }
+            }
+        }
+
+        /* Handle AURP packets */
+        if (aurp_fd >= 0 && FD_ISSET(aurp_fd, &readfds)) {
+            if (sigprocmask(SIG_BLOCK, &signal_set, &old_set) < 0) {
+                LOG(log_error, logtype_atalkd, "sigprocmask: %s", strerror(errno));
+                atalkd_exit(1);
+            }
+
+            aurp_input(aurp_fd);
+
+            if (sigprocmask(SIG_SETMASK, &old_set, NULL) < 0) {
+                LOG(log_error, logtype_atalkd, "sigprocmask old set: %s", strerror(errno));
+                atalkd_exit(1);
             }
         }
     }

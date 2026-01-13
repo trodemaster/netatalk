@@ -48,11 +48,11 @@ meson test -C build
 - [x] Created `etc/atalkd/aurp_config.c` - Configuration parsing
 - [x] Updated `etc/atalkd/meson.build` - Added AURP source files to build
 
-### Phase 2: Integration (IN PROGRESS)
-- [ ] Integrate AURP into main.c select() loop
-- [ ] Add AURP configuration parsing integration to config.c readconf()
-- [ ] Test compilation and fix any build errors
-- [ ] Initialize AURP on daemon startup
+### Phase 2: Integration (COMPLETED)
+- [x] Integrate AURP into main.c select() loop
+- [x] Add AURP configuration parsing integration to config.c readconf()
+- [x] Test compilation and fix any build errors
+- [x] Initialize AURP on daemon startup
 
 ### Phase 3: Testing (PENDING)
 - [ ] Basic UDP packet send/receive testing
@@ -112,7 +112,7 @@ aurp-peer 10.0.0.1            # Another peer
 
 ## Known Build Issues
 
-None currently - initial compilation not yet tested.
+None - AURP integration compiles successfully (tested 2026-01-12).
 
 ## Development Workflow
 
@@ -172,12 +172,13 @@ None currently - initial compilation not yet tested.
 
 ## Next Steps
 
-1. Complete main.c integration (add AURP socket to select loop)
-2. Complete config.c integration (parse AURP directives)
-3. Run first compilation test
-4. Fix any compilation errors
-5. Test basic AURP initialization
-6. Move to Phase 4 (Route Exchange) implementation
+1. ~~Complete main.c integration (add AURP socket to select loop)~~ DONE
+2. ~~Complete config.c integration (parse AURP directives)~~ DONE
+3. ~~Run first compilation test~~ DONE - Compiles successfully
+4. ~~Fix any compilation errors~~ DONE - No errors
+5. Test basic AURP initialization with sample config file
+6. Test AURP peer connection with jrouter or other AURP peer
+7. Move to Phase 4 (Route Exchange) implementation
 
 ## Commit Guidelines
 

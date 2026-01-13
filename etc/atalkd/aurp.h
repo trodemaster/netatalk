@@ -264,4 +264,15 @@ int aurp_zip_get_zones(uint16_t *nets, int count, char ***zones_out,
                        int **zone_counts_out);
 int aurp_zip_add_zones(uint16_t network, char **zones, int count);
 
+/*
+ * Function Prototypes - aurp_config.c (Configuration parsing)
+ */
+
+/* Configuration parsing functions */
+int aurp_config_parse(char **argv);
+int aurp_config_peer(char **av);
+int aurp_config_port(char **av);
+int aurp_config_listen(char **av);
+int aurp_config_open_peering(char **av);
+
 #endif /* ATALKD_AURP_H */
