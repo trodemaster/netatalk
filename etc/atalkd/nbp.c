@@ -441,16 +441,22 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                 rtmp = (struct rtmptab *)l->l_data;
 
                 if (rtmp->rt_gate == NULL) {
-                    for (iface = interfaces; iface;
-                            iface = iface->i_next) {
-                        if (iface->i_rt == rtmp) {
-                            break;
+                    /* Check if route has iface set (AURP routes) */
+                    if (rtmp->rt_iface != NULL) {
+                        iface = (struct interface *)rtmp->rt_iface;
+                    } else {
+                        /* Local route - find interface by checking i_rt head */
+                        for (iface = interfaces; iface;
+                                iface = iface->i_next) {
+                            if (iface->i_rt == rtmp) {
+                                break;
+                            }
                         }
-                    }
 
-                    if (!iface) {
-                        LOG(log_error, logtype_atalkd, "nbp_packet: Can't find route's interface!");
-                        return -1;
+                        if (!iface) {
+                            LOG(log_error, logtype_atalkd, "nbp_packet: Can't find route's interface!");
+                            return -1;
+                        }
                     }
 
                     ap = iface->i_ports;

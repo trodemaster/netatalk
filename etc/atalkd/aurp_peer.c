@@ -14,17 +14,20 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <netatalk/at.h>
 #include <atalk/logger.h>
 
 #include "aurp.h"
 #include "rtmp.h"
 #include "zip.h"
 #include "list.h"
+#include "interface.h"
 
 /* Generate random connection ID */
 static uint16_t aurp_generate_conn_id(void)
@@ -1075,9 +1078,24 @@ static struct rtmptab *aurp_find_route(struct aurp_peer *peer, uint16_t firstnet
 int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
                         uint16_t lastnet, uint8_t hops)
 {
-    struct rtmptab *rt;
+    struct rtmptab *rt, *irt;
+    extern struct interface *interfaces;
+    struct interface *iface;
 
     if (peer == NULL) {
+        return -1;
+    }
+
+    /* Get primary AppleTalk interface for route attachment
+     * Skip loopback interface, find first real interface */
+    for (iface = interfaces; iface != NULL; iface = iface->i_next) {
+        if ((iface->i_flags & IFACE_LOOPBACK) == 0 && iface->i_rt != NULL) {
+            break;
+        }
+    }
+    if (iface == NULL || iface->i_rt == NULL) {
+        LOG(log_error, logtype_atalkd,
+            "aurp_rtmp_add_route: no valid non-loopback interface for AURP routes");
         return -1;
     }
 
@@ -1110,7 +1128,7 @@ int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
         rt->rt_flags |= RTMPTAB_EXTENDED;
     }
     rt->rt_gate = NULL;  /* No AppleTalk gateway for AURP routes */
-    rt->rt_iface = NULL;  /* Will be set when forwarding */
+    rt->rt_iface = iface;  /* Set interface for route lookups */
 
     /* Add to peer's route list */
     rt->rt_next = peer->ap_routes;
@@ -1119,9 +1137,23 @@ int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
     }
     peer->ap_routes = rt;
 
+    /* Add to interface's route list (i_rt circular list)
+     * This makes the route visible to ZIP/NBP lookups */
+    irt = iface->i_rt;
+    if (irt->rt_inext == NULL) {  /* empty list */
+        rt->rt_inext = NULL;
+        rt->rt_iprev = rt;
+        irt->rt_inext = rt;
+    } else {
+        rt->rt_inext = irt->rt_inext;
+        rt->rt_iprev = irt->rt_inext->rt_iprev;
+        irt->rt_inext->rt_iprev = rt;
+        irt->rt_inext = rt;
+    }
+
     LOG(log_info, logtype_atalkd,
-        "aurp_rtmp_add_route: added %u-%u hops %u from %s",
-        firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr));
+        "aurp_rtmp_add_route: added %u-%u hops %u from %s to interface %s",
+        firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr), iface->i_name);
 
     return 0;
 }
@@ -1130,7 +1162,7 @@ int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
 void aurp_rtmp_remove_route(struct aurp_peer *peer, uint16_t firstnet,
                             uint16_t lastnet)
 {
-    struct rtmptab *rt;
+    struct rtmptab *rt, *irt;
 
     if (peer == NULL) {
         return;
@@ -1143,7 +1175,7 @@ void aurp_rtmp_remove_route(struct aurp_peer *peer, uint16_t firstnet,
         return;
     }
 
-    /* Remove from list */
+    /* Remove from peer's list */
     if (rt->rt_prev != NULL) {
         rt->rt_prev->rt_next = rt->rt_next;
     } else {
@@ -1151,6 +1183,31 @@ void aurp_rtmp_remove_route(struct aurp_peer *peer, uint16_t firstnet,
     }
     if (rt->rt_next != NULL) {
         rt->rt_next->rt_prev = rt->rt_prev;
+    }
+
+    /* Remove from interface list */
+    if (rt->rt_iprev != NULL) {
+        if (rt->rt_iprev == rt) {  /* only route in list */
+            if (rt->rt_iface != NULL && rt->rt_iface->i_rt != NULL) {
+                rt->rt_iface->i_rt->rt_inext = NULL;
+            }
+        } else {
+            /* Unlink from circular list */
+            if (rt->rt_inext != NULL) {
+                rt->rt_inext->rt_iprev = rt->rt_iprev;
+            }
+            if (rt->rt_iface != NULL && rt->rt_iface->i_rt != NULL) {
+                irt = rt->rt_iface->i_rt;
+                if (irt->rt_inext == rt) {
+                    if (rt->rt_inext != NULL) {
+                        irt->rt_inext = rt->rt_inext;
+                    } else {
+                        irt->rt_inext = NULL;
+                    }
+                }
+            }
+            rt->rt_iprev->rt_inext = rt->rt_inext;
+        }
     }
 
     LOG(log_info, logtype_atalkd,
