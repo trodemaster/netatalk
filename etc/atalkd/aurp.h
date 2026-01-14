@@ -46,6 +46,7 @@
 #define AURP_FLAG_SUI_ND_NRC    0x2000  /* Network Deleted or Route Change */
 #define AURP_FLAG_SUI_NDC       0x1000  /* Network Distance Change */
 #define AURP_FLAG_SUI_ZC        0x0800  /* Zone Change */
+#define AURP_FLAG_SUI_ALL       0x7800  /* All SUI flags combined */
 #define AURP_FLAG_LAST          0x8000  /* Last packet in sequence */
 #define AURP_FLAG_SZI           0x4000  /* Send Zone Info (in RI-Ack) */
 
@@ -217,6 +218,10 @@ int aurp_send_tickle_ack(struct aurp_peer *peer);
 int aurp_send_zi_req(struct aurp_peer *peer, uint16_t *nets, int count);
 int aurp_send_zi_rsp(struct aurp_peer *peer, int last);
 
+/* Data forwarding functions */
+struct aurp_peer *aurp_find_peer_for_net(uint16_t net);
+int aurp_send_data(uint16_t dst_net, char *ddp_data, int ddp_len);
+
 /* Packet building helpers */
 int aurp_build_header(char *buf, int buflen, uint16_t conn_id, uint16_t seq,
                       uint16_t cmd, uint16_t flags);
@@ -241,6 +246,7 @@ struct aurp_peer *aurp_peer_find_or_create(struct in_addr addr);
 void aurp_peer_connect(struct aurp_peer *peer);
 void aurp_peer_disconnect(struct aurp_peer *peer);
 void aurp_timer(void);
+void aurp_log_status(void);  /* Debug: log all peer/route/zone info */
 
 /* Packet handlers */
 void aurp_handle_open_req(struct aurp_peer *peer, char *data, int len);

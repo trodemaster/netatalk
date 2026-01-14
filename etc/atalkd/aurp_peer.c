@@ -47,7 +47,7 @@ struct aurp_peer *aurp_peer_new(struct in_addr addr, const char *hostname)
 
     peer = calloc(1, sizeof(struct aurp_peer));
     if (peer == NULL) {
-        LOG(log_error, logtype_default, "aurp_peer_new: calloc failed");
+        LOG(log_error, logtype_atalkd, "aurp_peer_new: calloc failed");
         return NULL;
     }
 
@@ -95,7 +95,7 @@ struct aurp_peer *aurp_peer_new(struct in_addr addr, const char *hostname)
 
     peer->ap_flags = 0;
 
-    LOG(log_info, logtype_default, "aurp_peer_new: created peer %s conn_id=%u",
+    LOG(log_info, logtype_atalkd, "aurp_peer_new: created peer %s conn_id=%u",
         inet_ntoa(peer->ap_addr), peer->ap_local_conn_id);
 
     return peer;
@@ -179,7 +179,7 @@ void aurp_peer_connect(struct aurp_peer *peer)
         return;
     }
 
-    LOG(log_info, logtype_default, "aurp_peer_connect: connecting to %s",
+    LOG(log_info, logtype_atalkd, "aurp_peer_connect: connecting to %s",
         inet_ntoa(peer->ap_addr));
 
     /* Set state */
@@ -201,7 +201,7 @@ void aurp_peer_disconnect(struct aurp_peer *peer)
         return;
     }
 
-    LOG(log_info, logtype_default, "aurp_peer_disconnect: disconnecting from %s",
+    LOG(log_info, logtype_atalkd, "aurp_peer_disconnect: disconnecting from %s",
         inet_ntoa(peer->ap_addr));
 
     /* Send Router Down if connected */
@@ -230,6 +230,13 @@ void aurp_timer(void)
 {
     struct aurp_peer *peer;
     time_t now = time(NULL);
+    static time_t last_status_log = 0;
+
+    /* Log status summary every 60 seconds for debugging */
+    if (now - last_status_log >= 60) {
+        aurp_log_status();
+        last_status_log = now;
+    }
 
     for (peer = aurp_config.ac_peers; peer != NULL; peer = peer->ap_next) {
         /* Check for connection timeout */
@@ -237,7 +244,7 @@ void aurp_timer(void)
             peer->ap_recv_state != AURP_RECV_CONNECTED) {
             if (peer->ap_last_heard > 0 &&
                 (now - peer->ap_last_heard) > AURP_LAST_HEARD_TIMER) {
-                LOG(log_warning, logtype_default,
+                LOG(log_warning, logtype_atalkd,
                     "aurp_timer: peer %s timed out waiting for response",
                     inet_ntoa(peer->ap_addr));
                 aurp_peer_disconnect(peer);
@@ -248,7 +255,7 @@ void aurp_timer(void)
             /* Retry sending last packet */
             if ((now - peer->ap_last_send) >= AURP_SEND_RETRY_TIMER) {
                 if (peer->ap_send_retries >= AURP_SEND_RETRY_LIMIT) {
-                    LOG(log_error, logtype_default,
+                    LOG(log_error, logtype_atalkd,
                         "aurp_timer: peer %s exceeded retry limit",
                         inet_ntoa(peer->ap_addr));
                     aurp_peer_disconnect(peer);
@@ -257,7 +264,7 @@ void aurp_timer(void)
                 }
 
                 if (peer->ap_last_pkt != NULL && peer->ap_last_pkt_len > 0) {
-                    LOG(log_debug, logtype_default,
+                    LOG(log_debug, logtype_atalkd,
                         "aurp_timer: retransmitting to %s (attempt %d)",
                         inet_ntoa(peer->ap_addr), peer->ap_send_retries + 1);
                     /* Retransmit last packet */
@@ -279,7 +286,7 @@ void aurp_timer(void)
             /* Check if peer is alive */
             if (peer->ap_last_heard > 0 &&
                 (now - peer->ap_last_heard) > AURP_LAST_HEARD_TIMER) {
-                LOG(log_warning, logtype_default,
+                LOG(log_warning, logtype_atalkd,
                     "aurp_timer: peer %s not responding to tickles",
                     inet_ntoa(peer->ap_addr));
                 aurp_peer_disconnect(peer);
@@ -299,7 +306,7 @@ void aurp_timer(void)
         if (peer->ap_recv_state == AURP_RECV_WAIT_TICKLE_ACK) {
             if ((now - peer->ap_last_send) >= AURP_SEND_RETRY_TIMER) {
                 if (peer->ap_tickle_retries >= AURP_TICKLE_RETRY_LIMIT) {
-                    LOG(log_error, logtype_default,
+                    LOG(log_error, logtype_atalkd,
                         "aurp_timer: peer %s tickle timeout",
                         inet_ntoa(peer->ap_addr));
                     aurp_peer_disconnect(peer);
@@ -316,7 +323,7 @@ void aurp_timer(void)
             (peer->ap_flags & AURP_PEER_CONFIGURED)) {
             if (peer->ap_last_reconnect > 0 &&
                 (now - peer->ap_last_reconnect) >= AURP_RECONNECT_TIMER) {
-                LOG(log_info, logtype_default,
+                LOG(log_info, logtype_atalkd,
                     "aurp_timer: attempting to reconnect to %s",
                     inet_ntoa(peer->ap_addr));
                 aurp_peer_connect(peer);
@@ -332,34 +339,117 @@ void aurp_timer(void)
 }
 
 /*
+ * Debug status logging
+ */
+
+/* Get recv state name for logging */
+static const char *get_recv_state_name(int state)
+{
+    switch (state) {
+        case AURP_RECV_UNCONNECTED:      return "UNCONNECTED";
+        case AURP_RECV_WAIT_OPEN_RSP:    return "WAIT_OPEN_RSP";
+        case AURP_RECV_WAIT_RI_RSP:      return "WAIT_RI_RSP";
+        case AURP_RECV_WAIT_ZI_RSP:      return "WAIT_ZI_RSP";
+        case AURP_RECV_CONNECTED:        return "CONNECTED";
+        case AURP_RECV_WAIT_TICKLE_ACK:  return "WAIT_TICKLE_ACK";
+        default:                         return "UNKNOWN";
+    }
+}
+
+/* Get send state name for logging */
+static const char *get_send_state_name(int state)
+{
+    switch (state) {
+        case AURP_SEND_UNCONNECTED:      return "UNCONNECTED";
+        case AURP_SEND_CONNECTED:        return "CONNECTED";
+        case AURP_SEND_WAIT_RI_RSP_ACK:  return "WAIT_RI_RSP_ACK";
+        case AURP_SEND_WAIT_RI_UPD_ACK:  return "WAIT_RI_UPD_ACK";
+        default:                         return "UNKNOWN";
+    }
+}
+
+/* Log detailed peer and zone status for debugging */
+void aurp_log_status(void)
+{
+    struct aurp_peer *peer;
+    struct rtmptab *rt;
+    struct list *l;
+    struct ziptab *zt;
+    int peer_count = 0, connected_count = 0;
+    int total_routes = 0, total_zones = 0;
+
+    LOG(log_info, logtype_atalkd, "=== AURP Status Summary ===");
+
+    for (peer = aurp_config.ac_peers; peer != NULL; peer = peer->ap_next) {
+        int route_count = 0, zone_count = 0;
+        peer_count++;
+
+        /* Count routes and zones for this peer */
+        for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
+            route_count++;
+            for (l = rt->rt_zt; l != NULL; l = l->l_next) {
+                zone_count++;
+            }
+        }
+        total_routes += route_count;
+        total_zones += zone_count;
+
+        if (peer->ap_recv_state == AURP_RECV_CONNECTED ||
+            peer->ap_recv_state == AURP_RECV_WAIT_TICKLE_ACK) {
+            connected_count++;
+        }
+
+        LOG(log_info, logtype_atalkd,
+            "  Peer %s: recv=%s send=%s routes=%d zones=%d conn_id=%u",
+            inet_ntoa(peer->ap_addr),
+            get_recv_state_name(peer->ap_recv_state),
+            get_send_state_name(peer->ap_send_state),
+            route_count, zone_count, peer->ap_local_conn_id);
+
+        /* Log routes learned from this peer at debug level */
+        for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
+            uint16_t firstnet = ntohs(rt->rt_firstnet);
+            uint16_t lastnet = ntohs(rt->rt_lastnet);
+
+            LOG(log_debug, logtype_atalkd,
+                "    Route %u-%u hops=%u flags=0x%x",
+                firstnet, lastnet, rt->rt_hops, rt->rt_flags);
+
+            /* Log zones for this route */
+            for (l = rt->rt_zt; l != NULL; l = l->l_next) {
+                zt = (struct ziptab *)l->l_data;
+                LOG(log_debug, logtype_atalkd,
+                    "      Zone: '%.*s'", zt->zt_len, zt->zt_name);
+            }
+        }
+    }
+
+    LOG(log_info, logtype_atalkd,
+        "=== AURP Totals: %d peers (%d connected), %d routes, %d zones ===",
+        peer_count, connected_count, total_routes, total_zones);
+}
+
+/*
  * Packet handlers
  */
 
 /* Handle Open-Req */
 void aurp_handle_open_req(struct aurp_peer *peer, char *data, int len)
 {
-    struct in_addr remote_di;
     uint16_t version;
-    int n;
 
-    LOG(log_info, logtype_default, "aurp_handle_open_req: from %s",
+    LOG(log_info, logtype_atalkd, "aurp_handle_open_req: from %s",
         inet_ntoa(peer->ap_addr));
 
-    /* Parse remote domain identifier */
-    n = aurp_parse_domain_id(data, len, &remote_di);
-    if (n < 0) {
-        LOG(log_error, logtype_default,
-            "aurp_handle_open_req: failed to parse domain identifier");
-        return;
-    }
-    data += n;
-    len -= n;
+    /*
+     * Note: Domain identifiers are already parsed in aurp_input() and
+     * stored in peer->ap_remote_di. The data pointer here points to
+     * the Open-Req specific payload (version + option count).
+     */
 
-    peer->ap_remote_di = remote_di;
-
-    /* Parse version */
+    /* Parse version (2 bytes) */
     if (len < 2) {
-        LOG(log_error, logtype_default,
+        LOG(log_error, logtype_atalkd,
             "aurp_handle_open_req: packet too short for version");
         return;
     }
@@ -369,19 +459,20 @@ void aurp_handle_open_req(struct aurp_peer *peer, char *data, int len)
     len -= 2;
 
     if (version != AURP_VERSION) {
-        LOG(log_warning, logtype_default,
+        LOG(log_warning, logtype_atalkd,
             "aurp_handle_open_req: unsupported version %u", version);
         aurp_send_open_rsp(peer, AURP_ERR_INVALID_VERSION);
         return;
     }
 
-    /* TODO: Parse options if present */
+    /* Option count is 1 byte, followed by option tuples if count > 0 */
+    /* For now, we ignore options */
 
     /* Accept connection */
     peer->ap_send_state = AURP_SEND_CONNECTED;
     aurp_send_open_rsp(peer, 0);  /* 0 = success */
 
-    LOG(log_info, logtype_default,
+    LOG(log_info, logtype_atalkd,
         "aurp_handle_open_req: accepted connection from %s",
         inet_ntoa(peer->ap_addr));
 }
@@ -389,36 +480,28 @@ void aurp_handle_open_req(struct aurp_peer *peer, char *data, int len)
 /* Handle Open-Rsp */
 void aurp_handle_open_rsp(struct aurp_peer *peer, char *data, int len)
 {
-    struct in_addr remote_di;
     int16_t error_code;
     uint16_t error_code_net;
-    int n;
 
-    LOG(log_info, logtype_default, "aurp_handle_open_rsp: from %s",
+    LOG(log_info, logtype_atalkd, "aurp_handle_open_rsp: from %s",
         inet_ntoa(peer->ap_addr));
 
     if (peer->ap_recv_state != AURP_RECV_WAIT_OPEN_RSP) {
-        LOG(log_warning, logtype_default,
+        LOG(log_warning, logtype_atalkd,
             "aurp_handle_open_rsp: unexpected Open-Rsp in state %d",
             peer->ap_recv_state);
         return;
     }
 
-    /* Parse remote domain identifier */
-    n = aurp_parse_domain_id(data, len, &remote_di);
-    if (n < 0) {
-        LOG(log_error, logtype_default,
-            "aurp_handle_open_rsp: failed to parse domain identifier");
-        return;
-    }
-    data += n;
-    len -= n;
+    /*
+     * Note: Domain identifiers are already parsed in aurp_input() and
+     * stored in peer->ap_remote_di. The data pointer here points to
+     * the Open-Rsp specific payload (error code/rate + option count).
+     */
 
-    peer->ap_remote_di = remote_di;
-
-    /* Parse error code */
+    /* Parse error code / rate (2 bytes, signed) */
     if (len < 2) {
-        LOG(log_error, logtype_default,
+        LOG(log_error, logtype_atalkd,
             "aurp_handle_open_rsp: packet too short for error code");
         return;
     }
@@ -427,13 +510,16 @@ void aurp_handle_open_rsp(struct aurp_peer *peer, char *data, int len)
     data += 2;
     len -= 2;
 
-    if (error_code != 0) {
-        LOG(log_error, logtype_default,
+    if (error_code < 0) {
+        LOG(log_error, logtype_atalkd,
             "aurp_handle_open_rsp: peer %s rejected connection (error %d)",
             inet_ntoa(peer->ap_addr), error_code);
         aurp_peer_disconnect(peer);
         return;
     }
+
+    /* Option count is 1 byte, followed by option tuples if count > 0 */
+    /* For now, we ignore options */
 
     /* Connection accepted - request routing information */
     peer->ap_recv_state = AURP_RECV_WAIT_RI_RSP;
@@ -442,15 +528,15 @@ void aurp_handle_open_rsp(struct aurp_peer *peer, char *data, int len)
 
     aurp_send_ri_req(peer);
 
-    LOG(log_info, logtype_default,
-        "aurp_handle_open_rsp: connection accepted by %s",
-        inet_ntoa(peer->ap_addr));
+    LOG(log_info, logtype_atalkd,
+        "aurp_handle_open_rsp: connection accepted by %s (rate=%d)",
+        inet_ntoa(peer->ap_addr), error_code);
 }
 
 /* Handle RI-Req */
 void aurp_handle_ri_req(struct aurp_peer *peer, char *data, int len)
 {
-    LOG(log_info, logtype_default, "aurp_handle_ri_req: from %s",
+    LOG(log_info, logtype_atalkd, "aurp_handle_ri_req: from %s",
         inet_ntoa(peer->ap_addr));
 
     /* Send routing information response */
@@ -467,7 +553,7 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
     uint16_t firstnet, lastnet;
     uint8_t dist;
 
-    LOG(log_info, logtype_default, "aurp_handle_ri_rsp: from %s len=%d",
+    LOG(log_info, logtype_atalkd, "aurp_handle_ri_rsp: from %s len=%d",
         inet_ntoa(peer->ap_addr), len);
 
     /* Parse network tuples */
@@ -485,7 +571,7 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
         if (dist & 0x80) {
             /* Extended tuple - has range end and reserved byte */
             if (len < 3) {
-                LOG(log_warning, logtype_default,
+                LOG(log_warning, logtype_atalkd,
                     "aurp_handle_ri_rsp: truncated extended tuple");
                 break;
             }
@@ -501,7 +587,7 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
             lastnet = firstnet;
         }
 
-        LOG(log_info, logtype_default,
+        LOG(log_info, logtype_atalkd,
             "aurp_handle_ri_rsp: learned route %u-%u dist %u from %s",
             firstnet, lastnet, dist, inet_ntoa(peer->ap_addr));
 
@@ -510,7 +596,7 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
         count++;
     }
 
-    LOG(log_info, logtype_default,
+    LOG(log_info, logtype_atalkd,
         "aurp_handle_ri_rsp: learned %d routes from %s",
         count, inet_ntoa(peer->ap_addr));
 
@@ -543,25 +629,25 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
                     /* Request zone information */
                     aurp_send_zi_req(peer, nets, net_count);
                     peer->ap_recv_state = AURP_RECV_WAIT_ZI_RSP;
-                    LOG(log_info, logtype_default,
+                    LOG(log_info, logtype_atalkd,
                         "aurp_handle_ri_rsp: requesting zones for %d networks from %s",
                         net_count, inet_ntoa(peer->ap_addr));
                 } else {
                     free(nets);
                     peer->ap_recv_state = AURP_RECV_CONNECTED;
-                    LOG(log_info, logtype_default,
+                    LOG(log_info, logtype_atalkd,
                         "aurp_handle_ri_rsp: connection fully established with %s (no zones needed)",
                         inet_ntoa(peer->ap_addr));
                 }
             } else {
                 /* Malloc failed, just connect without zones */
                 peer->ap_recv_state = AURP_RECV_CONNECTED;
-                LOG(log_warning, logtype_default,
+                LOG(log_warning, logtype_atalkd,
                     "aurp_handle_ri_rsp: malloc failed, connecting without zones");
             }
         } else {
             peer->ap_recv_state = AURP_RECV_CONNECTED;
-            LOG(log_info, logtype_default,
+            LOG(log_info, logtype_atalkd,
                 "aurp_handle_ri_rsp: connection fully established with %s (no routes)",
                 inet_ntoa(peer->ap_addr));
         }
@@ -571,7 +657,7 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
 /* Handle RI-Ack */
 void aurp_handle_ri_ack(struct aurp_peer *peer, char *data, int len)
 {
-    LOG(log_debug, logtype_default, "aurp_handle_ri_ack: from %s flags=0x%04x",
+    LOG(log_debug, logtype_atalkd, "aurp_handle_ri_ack: from %s flags=0x%04x",
         inet_ntoa(peer->ap_addr), peer->ap_last_recv_flags);
 
     /* Clear pending retransmission */
@@ -585,13 +671,13 @@ void aurp_handle_ri_ack(struct aurp_peer *peer, char *data, int len)
     /* If we're in SEND state waiting for RI-Rsp Ack, transition to connected */
     if (peer->ap_send_state == AURP_SEND_WAIT_RI_RSP_ACK) {
         peer->ap_send_state = AURP_SEND_CONNECTED;
-        LOG(log_debug, logtype_default,
+        LOG(log_debug, logtype_atalkd,
             "aurp_handle_ri_ack: sender now connected to %s",
             inet_ntoa(peer->ap_addr));
 
         /* If SZI flag is set, peer wants zone information */
         if (peer->ap_last_recv_flags & AURP_FLAG_SZI) {
-            LOG(log_info, logtype_default,
+            LOG(log_info, logtype_atalkd,
                 "aurp_handle_ri_ack: peer %s requested zone info (SZI flag)",
                 inet_ntoa(peer->ap_addr));
             aurp_send_zi_rsp(peer, 1);  /* Send all our zones */
@@ -613,7 +699,7 @@ void aurp_handle_ri_upd(struct aurp_peer *peer, char *data, int len)
     uint16_t firstnet, lastnet;
     uint8_t dist;
 
-    LOG(log_info, logtype_default, "aurp_handle_ri_upd: from %s len=%d",
+    LOG(log_info, logtype_atalkd, "aurp_handle_ri_upd: from %s len=%d",
         inet_ntoa(peer->ap_addr), len);
 
     /* Parse event tuples */
@@ -623,13 +709,13 @@ void aurp_handle_ri_upd(struct aurp_peer *peer, char *data, int len)
 
         if (event_code == AURP_EVT_NULL) {
             /* Null event - just the code, no data */
-            LOG(log_debug, logtype_default, "aurp_handle_ri_upd: null event");
+            LOG(log_debug, logtype_atalkd, "aurp_handle_ri_upd: null event");
             continue;
         }
 
         /* All other events have network tuple data */
         if (len < 3) {
-            LOG(log_warning, logtype_default,
+            LOG(log_warning, logtype_atalkd,
                 "aurp_handle_ri_upd: truncated event tuple");
             break;
         }
@@ -645,7 +731,7 @@ void aurp_handle_ri_upd(struct aurp_peer *peer, char *data, int len)
         if (dist & 0x80) {
             /* Extended tuple */
             if (len < 2) {
-                LOG(log_warning, logtype_default,
+                LOG(log_warning, logtype_atalkd,
                     "aurp_handle_ri_upd: truncated extended event");
                 break;
             }
@@ -658,7 +744,7 @@ void aurp_handle_ri_upd(struct aurp_peer *peer, char *data, int len)
             lastnet = firstnet;
         }
 
-        LOG(log_info, logtype_default,
+        LOG(log_info, logtype_atalkd,
             "aurp_handle_ri_upd: event %u net %u-%u dist %u from %s",
             event_code, firstnet, lastnet, dist, inet_ntoa(peer->ap_addr));
 
@@ -679,12 +765,12 @@ void aurp_handle_ri_upd(struct aurp_peer *peer, char *data, int len)
             break;
 
         case AURP_EVT_ZC:  /* Zone Change - handled in Phase 5 */
-            LOG(log_debug, logtype_default,
+            LOG(log_debug, logtype_atalkd,
                 "aurp_handle_ri_upd: zone change event (not implemented)");
             break;
 
         default:
-            LOG(log_warning, logtype_default,
+            LOG(log_warning, logtype_atalkd,
                 "aurp_handle_ri_upd: unknown event code %u", event_code);
             break;
         }
@@ -692,7 +778,7 @@ void aurp_handle_ri_upd(struct aurp_peer *peer, char *data, int len)
         count++;
     }
 
-    LOG(log_info, logtype_default,
+    LOG(log_info, logtype_atalkd,
         "aurp_handle_ri_upd: processed %d events from %s",
         count, inet_ntoa(peer->ap_addr));
 
@@ -711,7 +797,7 @@ void aurp_handle_rd(struct aurp_peer *peer, char *data, int len)
         error_code = (int16_t)ntohs(error_code_net);
     }
 
-    LOG(log_info, logtype_default, "aurp_handle_rd: from %s error=%d",
+    LOG(log_info, logtype_atalkd, "aurp_handle_rd: from %s error=%d",
         inet_ntoa(peer->ap_addr), error_code);
 
     aurp_peer_disconnect(peer);
@@ -720,7 +806,7 @@ void aurp_handle_rd(struct aurp_peer *peer, char *data, int len)
 /* Handle Tickle */
 void aurp_handle_tickle(struct aurp_peer *peer)
 {
-    LOG(log_debug, logtype_default, "aurp_handle_tickle: from %s",
+    LOG(log_debug, logtype_atalkd, "aurp_handle_tickle: from %s",
         inet_ntoa(peer->ap_addr));
 
     /* Send Tickle-Ack */
@@ -730,7 +816,7 @@ void aurp_handle_tickle(struct aurp_peer *peer)
 /* Handle Tickle-Ack */
 void aurp_handle_tickle_ack(struct aurp_peer *peer)
 {
-    LOG(log_debug, logtype_default, "aurp_handle_tickle_ack: from %s",
+    LOG(log_debug, logtype_atalkd, "aurp_handle_tickle_ack: from %s",
         inet_ntoa(peer->ap_addr));
 
     /* Return to connected state */
@@ -746,12 +832,12 @@ void aurp_handle_zi_req(struct aurp_peer *peer, char *data, int len)
     uint16_t subcode;
     int count;
 
-    LOG(log_info, logtype_default, "aurp_handle_zi_req: from %s len=%d",
+    LOG(log_info, logtype_atalkd, "aurp_handle_zi_req: from %s len=%d",
         inet_ntoa(peer->ap_addr), len);
 
     /* Parse subcode (2 bytes) */
     if (len < 2) {
-        LOG(log_warning, logtype_default,
+        LOG(log_warning, logtype_atalkd,
             "aurp_handle_zi_req: packet too short for subcode");
         return;
     }
@@ -761,14 +847,14 @@ void aurp_handle_zi_req(struct aurp_peer *peer, char *data, int len)
     len -= 2;
 
     if (subcode != AURP_SUBCODE_ZI_REQ) {
-        LOG(log_warning, logtype_default,
+        LOG(log_warning, logtype_atalkd,
             "aurp_handle_zi_req: unsupported subcode 0x%04x", subcode);
         return;
     }
 
     /* Count requested networks */
     count = len / 2;
-    LOG(log_debug, logtype_default,
+    LOG(log_debug, logtype_atalkd,
         "aurp_handle_zi_req: peer requesting zones for %d networks", count);
 
     /* For now, just send all our zones - a more complete implementation
@@ -785,12 +871,12 @@ void aurp_handle_zi_rsp(struct aurp_peer *peer, char *data, int len)
     struct rtmptab *rt;
     int zones_added = 0;
 
-    LOG(log_info, logtype_default, "aurp_handle_zi_rsp: from %s len=%d",
+    LOG(log_info, logtype_atalkd, "aurp_handle_zi_rsp: from %s len=%d",
         inet_ntoa(peer->ap_addr), len);
 
     /* Parse subcode (2 bytes) */
     if (len < 4) {
-        LOG(log_warning, logtype_default,
+        LOG(log_warning, logtype_atalkd,
             "aurp_handle_zi_rsp: packet too short");
         return;
     }
@@ -805,7 +891,7 @@ void aurp_handle_zi_rsp(struct aurp_peer *peer, char *data, int len)
     data += 2;
     len -= 2;
 
-    LOG(log_debug, logtype_default,
+    LOG(log_debug, logtype_atalkd,
         "aurp_handle_zi_rsp: subcode=0x%04x zone_count=%u",
         subcode, zone_count);
 
@@ -821,7 +907,7 @@ void aurp_handle_zi_rsp(struct aurp_peer *peer, char *data, int len)
         if ((uint8_t)*data & 0x80) {
             /* Optimized tuple - offset to zone name */
             /* Skip for now - would need to track first zone names */
-            LOG(log_debug, logtype_default,
+            LOG(log_debug, logtype_atalkd,
                 "aurp_handle_zi_rsp: skipping optimized tuple for net %u",
                 network);
             data += 2;
@@ -834,7 +920,7 @@ void aurp_handle_zi_rsp(struct aurp_peer *peer, char *data, int len)
         len--;
 
         if (zone_len > 32 || zone_len > len) {
-            LOG(log_warning, logtype_default,
+            LOG(log_warning, logtype_atalkd,
                 "aurp_handle_zi_rsp: invalid zone length %d", zone_len);
             break;
         }
@@ -844,30 +930,42 @@ void aurp_handle_zi_rsp(struct aurp_peer *peer, char *data, int len)
         data += zone_len;
         len -= zone_len;
 
-        LOG(log_info, logtype_default,
+        LOG(log_info, logtype_atalkd,
             "aurp_handle_zi_rsp: network %u zone '%s'",
             network, zone_name);
 
         /* Find the route for this network in peer's route list */
+        int route_found = 0;
         for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
             uint16_t rt_firstnet = ntohs(rt->rt_firstnet);
             uint16_t rt_lastnet = ntohs(rt->rt_lastnet);
 
             if (network >= rt_firstnet && network <= rt_lastnet) {
+                route_found = 1;
                 /* Add zone to this route */
-                if (addzone(rt, zone_len, zone_name) == 0) {
+                int addzone_result = addzone(rt, zone_len, zone_name);
+                if (addzone_result == 0) {
                     rt->rt_flags |= RTMPTAB_HASZONES;
                     zones_added++;
-                    LOG(log_debug, logtype_default,
-                        "aurp_handle_zi_rsp: added zone '%s' to route %u-%u",
+                    LOG(log_info, logtype_atalkd,
+                        "aurp_handle_zi_rsp: ADDED zone '%s' to route %u-%u",
                         zone_name, rt_firstnet, rt_lastnet);
+                } else {
+                    LOG(log_warning, logtype_atalkd,
+                        "aurp_handle_zi_rsp: addzone('%s') failed with %d for route %u-%u",
+                        zone_name, addzone_result, rt_firstnet, rt_lastnet);
                 }
                 break;
             }
         }
+        if (!route_found) {
+            LOG(log_warning, logtype_atalkd,
+                "aurp_handle_zi_rsp: no route found for network %u, cannot add zone '%s'",
+                network, zone_name);
+        }
     }
 
-    LOG(log_info, logtype_default,
+    LOG(log_info, logtype_atalkd,
         "aurp_handle_zi_rsp: added %d zones from %s",
         zones_added, inet_ntoa(peer->ap_addr));
 
@@ -881,7 +979,7 @@ void aurp_handle_zi_rsp(struct aurp_peer *peer, char *data, int len)
 
     if (peer->ap_recv_state == AURP_RECV_WAIT_ZI_RSP) {
         peer->ap_recv_state = AURP_RECV_CONNECTED;
-        LOG(log_info, logtype_default,
+        LOG(log_info, logtype_atalkd,
             "aurp_handle_zi_rsp: connection fully established with zones from %s",
             inet_ntoa(peer->ap_addr));
     }
@@ -905,7 +1003,7 @@ void aurp_queue_event(struct aurp_peer *peer, int code, struct rtmptab *rt)
         peer->ap_pending_alloc = 16;
         peer->ap_pending = malloc(peer->ap_pending_alloc * sizeof(struct aurp_event));
         if (peer->ap_pending == NULL) {
-            LOG(log_error, logtype_default, "aurp_queue_event: malloc failed");
+            LOG(log_error, logtype_atalkd, "aurp_queue_event: malloc failed");
             return;
         }
         peer->ap_pending_count = 0;
@@ -917,7 +1015,7 @@ void aurp_queue_event(struct aurp_peer *peer, int code, struct rtmptab *rt)
         struct aurp_event *new_pending = realloc(peer->ap_pending,
                                                   new_alloc * sizeof(struct aurp_event));
         if (new_pending == NULL) {
-            LOG(log_error, logtype_default, "aurp_queue_event: realloc failed");
+            LOG(log_error, logtype_atalkd, "aurp_queue_event: realloc failed");
             return;
         }
         peer->ap_pending = new_pending;
@@ -932,7 +1030,7 @@ void aurp_queue_event(struct aurp_peer *peer, int code, struct rtmptab *rt)
     event->ae_distance = rt->rt_hops;
     peer->ap_pending_count++;
 
-    LOG(log_debug, logtype_default,
+    LOG(log_debug, logtype_atalkd,
         "aurp_queue_event: queued event %d for peer %s (net %u-%u dist %u)",
         code, inet_ntoa(peer->ap_addr), rt->rt_firstnet, rt->rt_lastnet,
         rt->rt_hops);
@@ -989,7 +1087,7 @@ int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
         /* Update existing route */
         rt->rt_hops = hops + 1;  /* Add 1 for the AURP tunnel hop */
         rt->rt_state = RTMPTAB_GOOD;
-        LOG(log_debug, logtype_default,
+        LOG(log_debug, logtype_atalkd,
             "aurp_rtmp_add_route: updated %u-%u hops %u from %s",
             firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr));
         return 0;
@@ -998,7 +1096,7 @@ int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
     /* Allocate new route */
     rt = calloc(1, sizeof(struct rtmptab));
     if (rt == NULL) {
-        LOG(log_error, logtype_default, "aurp_rtmp_add_route: calloc failed");
+        LOG(log_error, logtype_atalkd, "aurp_rtmp_add_route: calloc failed");
         return -1;
     }
 
@@ -1021,7 +1119,7 @@ int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
     }
     peer->ap_routes = rt;
 
-    LOG(log_info, logtype_default,
+    LOG(log_info, logtype_atalkd,
         "aurp_rtmp_add_route: added %u-%u hops %u from %s",
         firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr));
 
@@ -1040,7 +1138,7 @@ void aurp_rtmp_remove_route(struct aurp_peer *peer, uint16_t firstnet,
 
     rt = aurp_find_route(peer, firstnet, lastnet);
     if (rt == NULL) {
-        LOG(log_debug, logtype_default,
+        LOG(log_debug, logtype_atalkd,
             "aurp_rtmp_remove_route: route %u-%u not found", firstnet, lastnet);
         return;
     }
@@ -1055,7 +1153,7 @@ void aurp_rtmp_remove_route(struct aurp_peer *peer, uint16_t firstnet,
         rt->rt_next->rt_prev = rt->rt_prev;
     }
 
-    LOG(log_info, logtype_default,
+    LOG(log_info, logtype_atalkd,
         "aurp_rtmp_remove_route: removed %u-%u from %s",
         firstnet, lastnet, inet_ntoa(peer->ap_addr));
 
@@ -1082,7 +1180,7 @@ void aurp_rtmp_update_route(struct aurp_peer *peer, uint16_t firstnet,
     rt->rt_hops = hops + 1;
     rt->rt_state = RTMPTAB_GOOD;
 
-    LOG(log_debug, logtype_default,
+    LOG(log_debug, logtype_atalkd,
         "aurp_rtmp_update_route: updated %u-%u hops %u from %s",
         firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr));
 }
@@ -1104,7 +1202,7 @@ void aurp_rtmp_delete_routes(struct aurp_peer *peer)
     }
     peer->ap_routes = NULL;
 
-    LOG(log_info, logtype_default,
+    LOG(log_info, logtype_atalkd,
         "aurp_rtmp_delete_routes: deleted %d routes from %s",
         count, inet_ntoa(peer->ap_addr));
 }
@@ -1118,7 +1216,7 @@ void aurp_rtmp_notify_route_added(struct rtmptab *rt)
         return;  /* Don't redistribute AURP-learned routes */
     }
 
-    LOG(log_debug, logtype_default,
+    LOG(log_debug, logtype_atalkd,
         "aurp_rtmp_notify_route_added: net %u-%u",
         ntohs(rt->rt_firstnet), ntohs(rt->rt_lastnet));
 
@@ -1138,7 +1236,7 @@ void aurp_rtmp_notify_route_deleted(struct rtmptab *rt)
         return;  /* Don't redistribute AURP-learned routes */
     }
 
-    LOG(log_debug, logtype_default,
+    LOG(log_debug, logtype_atalkd,
         "aurp_rtmp_notify_route_deleted: net %u-%u",
         ntohs(rt->rt_firstnet), ntohs(rt->rt_lastnet));
 
@@ -1158,7 +1256,7 @@ void aurp_rtmp_notify_route_changed(struct rtmptab *rt)
         return;  /* Don't redistribute AURP-learned routes */
     }
 
-    LOG(log_debug, logtype_default,
+    LOG(log_debug, logtype_atalkd,
         "aurp_rtmp_notify_route_changed: net %u-%u",
         ntohs(rt->rt_firstnet), ntohs(rt->rt_lastnet));
 

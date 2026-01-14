@@ -21,11 +21,14 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <atalk/logger.h>
+#include <atalk/ddp.h>
 #include <netatalk/at.h>
+#include <netatalk/ddp.h>
 
 #include "aurp.h"
 #include "rtmp.h"
 #include "interface.h"
+#include "atserv.h"
 #include "zip.h"
 #include "list.h"
 
@@ -41,6 +44,86 @@ struct aurp_config aurp_config = {
 
 /* Global AURP socket file descriptor */
 int aurp_fd = -1;
+
+/*
+ * Debug helper: hex dump for packet debugging
+ */
+static void aurp_hexdump(const char *prefix, const char *data, int len)
+{
+    char line[80];
+    int i, j, offset;
+
+    for (i = 0; i < len; i += 16) {
+        offset = snprintf(line, sizeof(line), "%s %04x: ", prefix, i);
+        for (j = 0; j < 16 && (i + j) < len; j++) {
+            offset += snprintf(line + offset, sizeof(line) - offset,
+                              "%02x ", (unsigned char)data[i + j]);
+        }
+        /* Pad if less than 16 bytes */
+        for (; j < 16; j++) {
+            offset += snprintf(line + offset, sizeof(line) - offset, "   ");
+        }
+        offset += snprintf(line + offset, sizeof(line) - offset, " |");
+        for (j = 0; j < 16 && (i + j) < len; j++) {
+            char c = data[i + j];
+            offset += snprintf(line + offset, sizeof(line) - offset, "%c",
+                              (c >= 32 && c < 127) ? c : '.');
+        }
+        snprintf(line + offset, sizeof(line) - offset, "|");
+        LOG(log_debug9, logtype_atalkd, "%s", line);
+    }
+}
+
+/*
+ * Debug helper: get command name string
+ */
+static const char *aurp_cmd_name(uint16_t cmd)
+{
+    switch (cmd) {
+        case AURP_CMD_RI_REQ:     return "RI-Req";
+        case AURP_CMD_RI_RSP:     return "RI-Rsp";
+        case AURP_CMD_RI_ACK:     return "RI-Ack";
+        case AURP_CMD_RI_UPD:     return "RI-Upd";
+        case AURP_CMD_RD:         return "RD";
+        case AURP_CMD_ZI_REQ:     return "ZI-Req";
+        case AURP_CMD_ZI_RSP:     return "ZI-Rsp";
+        case AURP_CMD_OPEN_REQ:   return "Open-Req";
+        case AURP_CMD_OPEN_RSP:   return "Open-Rsp";
+        case AURP_CMD_TICKLE:     return "Tickle";
+        case AURP_CMD_TICKLE_ACK: return "Tickle-Ack";
+        default:                  return "Unknown";
+    }
+}
+
+/*
+ * Debug helper: get recv state name string
+ */
+static const char *aurp_recv_state_name(int state)
+{
+    switch (state) {
+        case AURP_RECV_UNCONNECTED:      return "UNCONNECTED";
+        case AURP_RECV_WAIT_OPEN_RSP:    return "WAIT_OPEN_RSP";
+        case AURP_RECV_WAIT_RI_RSP:      return "WAIT_RI_RSP";
+        case AURP_RECV_WAIT_ZI_RSP:      return "WAIT_ZI_RSP";
+        case AURP_RECV_CONNECTED:        return "CONNECTED";
+        case AURP_RECV_WAIT_TICKLE_ACK:  return "WAIT_TICKLE_ACK";
+        default:                         return "UNKNOWN";
+    }
+}
+
+/*
+ * Debug helper: get send state name string
+ */
+static const char *aurp_send_state_name(int state)
+{
+    switch (state) {
+        case AURP_SEND_UNCONNECTED:      return "UNCONNECTED";
+        case AURP_SEND_CONNECTED:        return "CONNECTED";
+        case AURP_SEND_WAIT_RI_RSP_ACK:  return "WAIT_RI_RSP_ACK";
+        case AURP_SEND_WAIT_RI_UPD_ACK:  return "WAIT_RI_UPD_ACK";
+        default:                         return "UNKNOWN";
+    }
+}
 
 /*
  * Sequence number utilities
@@ -67,31 +150,33 @@ int aurp_seq_is_successor(uint16_t seq, uint16_t prev)
  * Domain Identifier encoding/decoding
  */
 
-/* Build domain identifier into buffer */
+/* Build domain identifier into buffer (RFC 1504 format) */
 int aurp_build_domain_id(char *buf, int buflen, struct in_addr *addr)
 {
-    if (buflen < 3) {
+    if (buflen < 2) {
         return -1;
     }
 
     if (addr->s_addr == INADDR_ANY) {
-        /* NULL domain identifier */
-        buf[0] = 0;  /* Length 0 */
+        /* NULL domain identifier: length=1, authority=0 */
+        buf[0] = 1;  /* Length 1 (includes authority byte) */
         buf[1] = AURP_DI_NULL;
         return 2;
     } else {
-        /* IP domain identifier (4 bytes) */
-        if (buflen < 6) {
+        /* IP domain identifier (RFC 1504): length=7, authority=1, distinguisher(2), IP(4) */
+        if (buflen < 8) {
             return -1;
         }
-        buf[0] = 4;  /* Length 4 */
+        buf[0] = 7;  /* Length 7 */
         buf[1] = AURP_DI_IP;
-        memcpy(buf + 2, &addr->s_addr, 4);
-        return 6;
+        buf[2] = 0;  /* Distinguisher high byte */
+        buf[3] = 0;  /* Distinguisher low byte */
+        memcpy(buf + 4, &addr->s_addr, 4);
+        return 8;
     }
 }
 
-/* Parse domain identifier from buffer */
+/* Parse domain identifier from buffer (RFC 1504 format) */
 int aurp_parse_domain_id(char *buf, int len, struct in_addr *addr)
 {
     uint8_t di_len;
@@ -108,11 +193,13 @@ int aurp_parse_domain_id(char *buf, int len, struct in_addr *addr)
         addr->s_addr = INADDR_ANY;
         return 2;
     } else if (di_type == AURP_DI_IP) {
-        if (di_len != 4 || len < 6) {
+        /* RFC 1504: length=7, authority=1, distinguisher(2), IP(4) */
+        if (di_len != 7 || len < 8) {
             return -1;
         }
-        memcpy(&addr->s_addr, buf + 2, 4);
-        return 6;
+        /* Skip distinguisher bytes (2-3), read IP from bytes 4-7 */
+        memcpy(&addr->s_addr, buf + 4, 4);
+        return 8;
     } else {
         /* Unknown domain identifier type */
         return -1;
@@ -120,10 +207,119 @@ int aurp_parse_domain_id(char *buf, int len, struct in_addr *addr)
 }
 
 /*
- * AURP Header building
+ * Domain Header and AURP Header building
  */
 
-/* Build AURP header (connection ID + sequence + command code + flags) */
+/* Build complete domain header into buffer */
+static int aurp_build_domain_header(char *buf, int buflen, struct aurp_peer *peer,
+                                     uint16_t pkt_type)
+{
+    int len = 0;
+    int n;
+    uint16_t tmp;
+
+    /* Destination domain identifier (peer's DI) */
+    n = aurp_build_domain_id(buf + len, buflen - len, &peer->ap_remote_di);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Source domain identifier (our DI) */
+    n = aurp_build_domain_id(buf + len, buflen - len, &peer->ap_local_di);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Check remaining space for version + reserved + packet type */
+    if (buflen - len < 6) {
+        return -1;
+    }
+
+    /* Version (2 bytes) */
+    tmp = htons(AURP_VERSION);
+    memcpy(buf + len, &tmp, 2);
+    len += 2;
+
+    /* Reserved (2 bytes) */
+    tmp = 0;
+    memcpy(buf + len, &tmp, 2);
+    len += 2;
+
+    /* Packet type (2 bytes) */
+    tmp = htons(pkt_type);
+    memcpy(buf + len, &tmp, 2);
+    len += 2;
+
+    return len;
+}
+
+/* Build transport header (connection ID + sequence) */
+static int aurp_build_transport_header(char *buf, int buflen, uint16_t conn_id,
+                                        uint16_t seq)
+{
+    uint16_t tmp;
+
+    if (buflen < 4) {
+        return -1;
+    }
+
+    /* Connection ID (2 bytes, big-endian) */
+    tmp = htons(conn_id);
+    memcpy(buf, &tmp, 2);
+
+    /* Sequence number (2 bytes, big-endian) */
+    tmp = htons(seq);
+    memcpy(buf + 2, &tmp, 2);
+
+    return 4;
+}
+
+/* Build AURP command header (command code + flags) */
+static int aurp_build_cmd_header(char *buf, int buflen, uint16_t cmd,
+                                  uint16_t flags)
+{
+    uint16_t tmp;
+
+    if (buflen < 4) {
+        return -1;
+    }
+
+    /* Command code (2 bytes, big-endian) */
+    tmp = htons(cmd);
+    memcpy(buf, &tmp, 2);
+
+    /* Flags (2 bytes, big-endian) */
+    tmp = htons(flags);
+    memcpy(buf + 2, &tmp, 2);
+
+    return 4;
+}
+
+/* Build complete routing packet header (domain + transport + command) */
+static int aurp_build_routing_header(char *buf, int buflen, struct aurp_peer *peer,
+                                      uint16_t conn_id, uint16_t seq,
+                                      uint16_t cmd, uint16_t flags)
+{
+    int len = 0;
+    int n;
+
+    /* Domain header */
+    n = aurp_build_domain_header(buf + len, buflen - len, peer, AURP_PKT_ROUTING);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Transport header */
+    n = aurp_build_transport_header(buf + len, buflen - len, conn_id, seq);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Command header */
+    n = aurp_build_cmd_header(buf + len, buflen - len, cmd, flags);
+    if (n < 0) return -1;
+    len += n;
+
+    return len;
+}
+
+/* Legacy function - now builds complete routing header */
 int aurp_build_header(char *buf, int buflen, uint16_t conn_id, uint16_t seq,
                       uint16_t cmd, uint16_t flags)
 {
@@ -170,14 +366,14 @@ int aurp_init(struct aurp_config *cfg)
     /* Create UDP socket */
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        LOG(log_error, logtype_default, "aurp_init: socket() failed: %s",
+        LOG(log_error, logtype_atalkd, "aurp_init: socket() failed: %s",
             strerror(errno));
         return -1;
     }
 
     /* Set socket options */
     if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
-        LOG(log_error, logtype_default, "aurp_init: setsockopt(SO_REUSEADDR) failed: %s",
+        LOG(log_error, logtype_atalkd, "aurp_init: setsockopt(SO_REUSEADDR) failed: %s",
             strerror(errno));
         close(sock);
         return -1;
@@ -190,7 +386,7 @@ int aurp_init(struct aurp_config *cfg)
     sin.sin_port = htons(cfg->ac_port);
 
     if (bind(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
-        LOG(log_error, logtype_default, "aurp_init: bind(%s:%d) failed: %s",
+        LOG(log_error, logtype_atalkd, "aurp_init: bind(%s:%d) failed: %s",
             inet_ntoa(cfg->ac_listen_addr), cfg->ac_port, strerror(errno));
         close(sock);
         return -1;
@@ -198,7 +394,7 @@ int aurp_init(struct aurp_config *cfg)
 
     aurp_fd = sock;
 
-    LOG(log_info, logtype_default, "AURP initialized on %s:%d",
+    LOG(log_info, logtype_atalkd, "AURP initialized on %s:%d",
         inet_ntoa(cfg->ac_listen_addr), cfg->ac_port);
 
     /* Initiate connections to configured peers */
@@ -214,6 +410,9 @@ int aurp_init(struct aurp_config *cfg)
  * Packet reception and dispatch
  */
 
+/* Forward declaration for data packet handler */
+static void aurp_handle_data(struct aurp_peer *peer, char *data, int len);
+
 /* Receive and process AURP packets */
 void aurp_input(int fd)
 {
@@ -222,62 +421,150 @@ void aurp_input(int fd)
     socklen_t fromlen = sizeof(from);
     ssize_t len;
     struct aurp_peer *peer;
-    struct in_addr peer_addr;
+    struct in_addr peer_addr, dest_di, src_di;
+    uint16_t version, reserved, pkt_type;
     uint16_t conn_id, seq, cmd, flags;
-    char *data;
-    int datalen;
+    char *p;
+    int n, remaining;
 
     /* Receive UDP packet */
     len = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fromlen);
     if (len < 0) {
-        LOG(log_error, logtype_default, "aurp_input: recvfrom() failed: %s",
+        LOG(log_error, logtype_atalkd, "aurp_input: recvfrom() failed: %s",
             strerror(errno));
         return;
     }
 
-    if (len < 8) {
-        LOG(log_debug, logtype_default, "aurp_input: packet too short (%zd bytes)", len);
+    LOG(log_debug, logtype_atalkd,
+        "aurp_input: received %zd bytes from %s:%d",
+        len, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+    aurp_hexdump("RECV", buf, len);
+
+    if (len < 22) {  /* Minimum: 2 null DIs (4 bytes) + version(2) + reserved(2) + type(2) + header(8) = 18 */
+        LOG(log_debug, logtype_atalkd, "aurp_input: packet too short (%zd bytes)", len);
         return;
     }
 
     peer_addr = from.sin_addr;
+    p = buf;
+    remaining = len;
 
-    /* Parse AURP header */
-    memcpy(&conn_id, buf, 2);
-    conn_id = ntohs(conn_id);
-    memcpy(&seq, buf + 2, 2);
-    seq = ntohs(seq);
-    memcpy(&cmd, buf + 4, 2);
-    cmd = ntohs(cmd);
-    memcpy(&flags, buf + 6, 2);
-    flags = ntohs(flags);
+    /*
+     * Parse Domain Header (RFC 1504)
+     * - Destination Domain Identifier
+     * - Source Domain Identifier
+     * - Version (2 bytes)
+     * - Reserved (2 bytes)
+     * - Packet Type (2 bytes)
+     */
 
-    data = buf + 8;
-    datalen = len - 8;
+    /* Parse destination domain identifier */
+    n = aurp_parse_domain_id(p, remaining, &dest_di);
+    if (n < 0) {
+        LOG(log_debug, logtype_atalkd, "aurp_input: failed to parse dest DI from %s",
+            inet_ntoa(peer_addr));
+        return;
+    }
+    p += n;
+    remaining -= n;
 
-    LOG(log_debug, logtype_default,
-        "aurp_input: from %s conn_id=%u seq=%u cmd=0x%04x flags=0x%04x len=%d",
-        inet_ntoa(peer_addr), conn_id, seq, cmd, flags, datalen);
+    /* Parse source domain identifier */
+    n = aurp_parse_domain_id(p, remaining, &src_di);
+    if (n < 0) {
+        LOG(log_debug, logtype_atalkd, "aurp_input: failed to parse src DI from %s",
+            inet_ntoa(peer_addr));
+        return;
+    }
+    p += n;
+    remaining -= n;
+
+    /* Parse version, reserved, packet type */
+    if (remaining < 6) {
+        LOG(log_debug, logtype_atalkd, "aurp_input: packet too short for domain header");
+        return;
+    }
+
+    memcpy(&version, p, 2);
+    version = ntohs(version);
+    memcpy(&reserved, p + 2, 2);
+    reserved = ntohs(reserved);
+    memcpy(&pkt_type, p + 4, 2);
+    pkt_type = ntohs(pkt_type);
+    p += 6;
+    remaining -= 6;
+
+    /* Verify version */
+    if (version != AURP_VERSION) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_input: unsupported version %u from %s", version, inet_ntoa(peer_addr));
+        return;
+    }
 
     /* Find or create peer */
     peer = aurp_peer_find(peer_addr);
     if (peer == NULL) {
         if (!aurp_config.ac_open_peering) {
-            LOG(log_info, logtype_default,
+            LOG(log_info, logtype_atalkd,
                 "aurp_input: ignoring packet from unknown peer %s (open peering disabled)",
                 inet_ntoa(peer_addr));
             return;
         }
         peer = aurp_peer_find_or_create(peer_addr);
         if (peer == NULL) {
-            LOG(log_error, logtype_default,
+            LOG(log_error, logtype_atalkd,
                 "aurp_input: failed to create peer for %s", inet_ntoa(peer_addr));
             return;
         }
     }
 
-    /* Update last heard time */
+    /* Update last heard time and remote DI */
     peer->ap_last_heard = time(NULL);
+    peer->ap_remote_di = src_di;
+
+    /* Handle packet based on type */
+    if (pkt_type == AURP_PKT_APPLETALK) {
+        /* Encapsulated AppleTalk data packet */
+        LOG(log_debug, logtype_atalkd,
+            "aurp_input: AppleTalk data packet from %s len=%d",
+            inet_ntoa(peer_addr), remaining);
+        aurp_handle_data(peer, p, remaining);
+        return;
+    } else if (pkt_type != AURP_PKT_ROUTING) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_input: unknown packet type 0x%04x from %s",
+            pkt_type, inet_ntoa(peer_addr));
+        return;
+    }
+
+    /*
+     * Parse Transport Header for Routing packets
+     * - Connection ID (2 bytes)
+     * - Sequence Number (2 bytes)
+     * Then AURP Header:
+     * - Command Code (2 bytes)
+     * - Flags (2 bytes)
+     */
+    if (remaining < 8) {
+        LOG(log_debug, logtype_atalkd,
+            "aurp_input: routing packet too short (%d bytes)", remaining);
+        return;
+    }
+
+    memcpy(&conn_id, p, 2);
+    conn_id = ntohs(conn_id);
+    memcpy(&seq, p + 2, 2);
+    seq = ntohs(seq);
+    memcpy(&cmd, p + 4, 2);
+    cmd = ntohs(cmd);
+    memcpy(&flags, p + 6, 2);
+    flags = ntohs(flags);
+    p += 8;
+    remaining -= 8;
+
+    LOG(log_info, logtype_atalkd,
+        "aurp_input: %s from %s conn_id=%u seq=%u flags=0x%04x data_len=%d recv_state=%s send_state=%s",
+        aurp_cmd_name(cmd), inet_ntoa(peer_addr), conn_id, seq, flags, remaining,
+        aurp_recv_state_name(peer->ap_recv_state), aurp_send_state_name(peer->ap_send_state));
 
     /* Update remote connection ID and sequence if appropriate */
     if (cmd == AURP_CMD_OPEN_REQ || cmd == AURP_CMD_OPEN_RSP) {
@@ -291,31 +578,31 @@ void aurp_input(int fd)
     /* Dispatch to appropriate handler */
     switch (cmd) {
         case AURP_CMD_OPEN_REQ:
-            aurp_handle_open_req(peer, data, datalen);
+            aurp_handle_open_req(peer, p, remaining);
             break;
         case AURP_CMD_OPEN_RSP:
-            aurp_handle_open_rsp(peer, data, datalen);
+            aurp_handle_open_rsp(peer, p, remaining);
             break;
         case AURP_CMD_RI_REQ:
-            aurp_handle_ri_req(peer, data, datalen);
+            aurp_handle_ri_req(peer, p, remaining);
             break;
         case AURP_CMD_RI_RSP:
-            aurp_handle_ri_rsp(peer, data, datalen);
+            aurp_handle_ri_rsp(peer, p, remaining);
             break;
         case AURP_CMD_RI_ACK:
-            aurp_handle_ri_ack(peer, data, datalen);
+            aurp_handle_ri_ack(peer, p, remaining);
             break;
         case AURP_CMD_RI_UPD:
-            aurp_handle_ri_upd(peer, data, datalen);
+            aurp_handle_ri_upd(peer, p, remaining);
             break;
         case AURP_CMD_RD:
-            aurp_handle_rd(peer, data, datalen);
+            aurp_handle_rd(peer, p, remaining);
             break;
         case AURP_CMD_ZI_REQ:
-            aurp_handle_zi_req(peer, data, datalen);
+            aurp_handle_zi_req(peer, p, remaining);
             break;
         case AURP_CMD_ZI_RSP:
-            aurp_handle_zi_rsp(peer, data, datalen);
+            aurp_handle_zi_rsp(peer, p, remaining);
             break;
         case AURP_CMD_TICKLE:
             aurp_handle_tickle(peer);
@@ -324,7 +611,7 @@ void aurp_input(int fd)
             aurp_handle_tickle_ack(peer);
             break;
         default:
-            LOG(log_info, logtype_default,
+            LOG(log_info, logtype_atalkd,
                 "aurp_input: unknown command 0x%04x from %s",
                 cmd, inet_ntoa(peer_addr));
             break;
@@ -350,15 +637,20 @@ static int aurp_send_packet(struct aurp_peer *peer, char *buf, int len)
     sin.sin_addr = peer->ap_addr;
     sin.sin_port = htons(aurp_config.ac_port);
 
+    LOG(log_debug, logtype_atalkd,
+        "aurp_send_packet: sending %d bytes to %s:%d",
+        len, inet_ntoa(peer->ap_addr), aurp_config.ac_port);
+    aurp_hexdump("SEND", buf, len);
+
     sent = sendto(aurp_fd, buf, len, 0, (struct sockaddr *)&sin, sizeof(sin));
     if (sent < 0) {
-        LOG(log_error, logtype_default, "aurp_send_packet: sendto(%s) failed: %s",
+        LOG(log_error, logtype_atalkd, "aurp_send_packet: sendto(%s) failed: %s",
             inet_ntoa(peer->ap_addr), strerror(errno));
         return -1;
     }
 
     if (sent != len) {
-        LOG(log_warning, logtype_default,
+        LOG(log_warning, logtype_atalkd,
             "aurp_send_packet: partial send to %s (%zd of %d bytes)",
             inet_ntoa(peer->ap_addr), sent, len);
         return -1;
@@ -375,16 +667,10 @@ int aurp_send_open_req(struct aurp_peer *peer)
     int len = 0;
     int n;
     uint16_t version;
-    uint16_t option_count = 0;
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_OPEN_REQ, 0);
-    if (n < 0) return -1;
-    len += n;
-
-    /* Build sender's domain identifier */
-    n = aurp_build_domain_id(buf + len, sizeof(buf) - len, &peer->ap_local_di);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_local_conn_id,
+                                   0, AURP_CMD_OPEN_REQ, AURP_FLAG_SUI_ALL);
     if (n < 0) return -1;
     len += n;
 
@@ -393,9 +679,8 @@ int aurp_send_open_req(struct aurp_peer *peer)
     memcpy(buf + len, &version, 2);
     len += 2;
 
-    /* Option count (2 bytes) - currently 0 */
-    memcpy(buf + len, &option_count, 2);
-    len += 2;
+    /* Option count (1 byte) - per jrouter/RFC, this is a single byte */
+    buf[len++] = 0;  /* No options */
 
     /* Send packet */
     if (aurp_send_packet(peer, buf, len) < 0) {
@@ -412,9 +697,7 @@ int aurp_send_open_req(struct aurp_peer *peer)
         peer->ap_last_pkt_len = len;
     }
 
-    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
-
-    LOG(log_info, logtype_default, "aurp_send_open_req: sent to %s",
+    LOG(log_info, logtype_atalkd, "aurp_send_open_req: sent to %s",
         inet_ntoa(peer->ap_addr));
 
     return 0;
@@ -427,36 +710,27 @@ int aurp_send_open_rsp(struct aurp_peer *peer, int16_t result)
     int len = 0;
     int n;
     int16_t error_code;
-    uint16_t option_count = 0;
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_OPEN_RSP, 0);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_remote_conn_id,
+                                   0, AURP_CMD_OPEN_RSP, 0);
     if (n < 0) return -1;
     len += n;
 
-    /* Build sender's domain identifier */
-    n = aurp_build_domain_id(buf + len, sizeof(buf) - len, &peer->ap_local_di);
-    if (n < 0) return -1;
-    len += n;
-
-    /* Error code (2 bytes, signed, big-endian) */
+    /* Error code / update rate (2 bytes, signed, big-endian) */
     error_code = htons((uint16_t)result);
     memcpy(buf + len, &error_code, 2);
     len += 2;
 
-    /* Option count (2 bytes) - currently 0 */
-    memcpy(buf + len, &option_count, 2);
-    len += 2;
+    /* Option count (1 byte) - per jrouter/RFC, this is a single byte */
+    buf[len++] = 0;  /* No options */
 
     /* Send packet */
     if (aurp_send_packet(peer, buf, len) < 0) {
         return -1;
     }
 
-    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
-
-    LOG(log_info, logtype_default, "aurp_send_open_rsp: sent to %s result=%d",
+    LOG(log_info, logtype_atalkd, "aurp_send_open_rsp: sent to %s result=%d",
         inet_ntoa(peer->ap_addr), result);
 
     return 0;
@@ -469,9 +743,9 @@ int aurp_send_ri_req(struct aurp_peer *peer)
     int len = 0;
     int n;
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_RI_REQ, 0);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_local_conn_id,
+                                   0, AURP_CMD_RI_REQ, AURP_FLAG_SUI_ALL);
     if (n < 0) return -1;
     len += n;
 
@@ -490,9 +764,7 @@ int aurp_send_ri_req(struct aurp_peer *peer)
         peer->ap_last_pkt_len = len;
     }
 
-    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
-
-    LOG(log_info, logtype_default, "aurp_send_ri_req: sent to %s",
+    LOG(log_info, logtype_atalkd, "aurp_send_ri_req: sent to %s",
         inet_ntoa(peer->ap_addr));
 
     return 0;
@@ -505,9 +777,9 @@ int aurp_send_tickle(struct aurp_peer *peer)
     int len = 0;
     int n;
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_TICKLE, 0);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_local_conn_id,
+                                   0, AURP_CMD_TICKLE, 0);
     if (n < 0) return -1;
     len += n;
 
@@ -526,9 +798,7 @@ int aurp_send_tickle(struct aurp_peer *peer)
         peer->ap_last_pkt_len = len;
     }
 
-    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
-
-    LOG(log_debug, logtype_default, "aurp_send_tickle: sent to %s",
+    LOG(log_debug, logtype_atalkd, "aurp_send_tickle: sent to %s",
         inet_ntoa(peer->ap_addr));
 
     return 0;
@@ -541,9 +811,9 @@ int aurp_send_tickle_ack(struct aurp_peer *peer)
     int len = 0;
     int n;
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_TICKLE_ACK, 0);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_remote_conn_id,
+                                   0, AURP_CMD_TICKLE_ACK, 0);
     if (n < 0) return -1;
     len += n;
 
@@ -552,9 +822,7 @@ int aurp_send_tickle_ack(struct aurp_peer *peer)
         return -1;
     }
 
-    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
-
-    LOG(log_debug, logtype_default, "aurp_send_tickle_ack: sent to %s",
+    LOG(log_debug, logtype_atalkd, "aurp_send_tickle_ack: sent to %s",
         inet_ntoa(peer->ap_addr));
 
     return 0;
@@ -578,9 +846,9 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
         flags |= AURP_FLAG_LAST;
     }
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_RI_RSP, flags);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_remote_conn_id,
+                                   peer->ap_local_seq, AURP_CMD_RI_RSP, flags);
     if (n < 0) return -1;
     len += n;
 
@@ -605,7 +873,7 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
 
         /* Check buffer space */
         if (len + 6 > sizeof(buf)) {
-            LOG(log_warning, logtype_default,
+            LOG(log_warning, logtype_atalkd,
                 "aurp_send_ri_rsp: packet full, need multiple packets");
             break;
         }
@@ -628,7 +896,7 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
             buf[len++] = 0x00;  /* Reserved */
         }
 
-        LOG(log_debug, logtype_default,
+        LOG(log_debug, logtype_atalkd,
             "aurp_send_ri_rsp: adding network %u-%u dist %u",
             firstnet, lastnet, dist);
     }
@@ -650,7 +918,7 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
 
     peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
 
-    LOG(log_info, logtype_default, "aurp_send_ri_rsp: sent to %s (last=%d)",
+    LOG(log_info, logtype_atalkd, "aurp_send_ri_rsp: sent to %s (last=%d)",
         inet_ntoa(peer->ap_addr), last);
 
     return 0;
@@ -665,9 +933,9 @@ int aurp_send_ri_ack(struct aurp_peer *peer, uint16_t flags)
     int len = 0;
     int n;
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_RI_ACK, flags);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_local_conn_id,
+                                   peer->ap_remote_seq, AURP_CMD_RI_ACK, flags);
     if (n < 0) return -1;
     len += n;
 
@@ -676,9 +944,7 @@ int aurp_send_ri_ack(struct aurp_peer *peer, uint16_t flags)
         return -1;
     }
 
-    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
-
-    LOG(log_debug, logtype_default, "aurp_send_ri_ack: sent to %s flags=0x%04x",
+    LOG(log_debug, logtype_atalkd, "aurp_send_ri_ack: sent to %s flags=0x%04x",
         inet_ntoa(peer->ap_addr), flags);
 
     return 0;
@@ -698,9 +964,9 @@ int aurp_send_ri_upd(struct aurp_peer *peer)
         return 0;  /* Nothing to send */
     }
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_RI_UPD, 0);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_remote_conn_id,
+                                   peer->ap_local_seq, AURP_CMD_RI_UPD, 0);
     if (n < 0) return -1;
     len += n;
 
@@ -748,7 +1014,7 @@ int aurp_send_ri_upd(struct aurp_peer *peer)
     peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
     peer->ap_send_state = AURP_SEND_WAIT_RI_UPD_ACK;
 
-    LOG(log_info, logtype_default, "aurp_send_ri_upd: sent %d events to %s",
+    LOG(log_info, logtype_atalkd, "aurp_send_ri_upd: sent %d events to %s",
         peer->ap_pending_count, inet_ntoa(peer->ap_addr));
 
     /* Clear pending events */
@@ -767,9 +1033,9 @@ int aurp_send_rd(struct aurp_peer *peer, int16_t error)
     int n;
     int16_t error_net;
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_RD, 0);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_local_conn_id,
+                                   0, AURP_CMD_RD, 0);
     if (n < 0) return -1;
     len += n;
 
@@ -783,9 +1049,7 @@ int aurp_send_rd(struct aurp_peer *peer, int16_t error)
         return -1;
     }
 
-    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
-
-    LOG(log_info, logtype_default, "aurp_send_rd: sent to %s error=%d",
+    LOG(log_info, logtype_atalkd, "aurp_send_rd: sent to %s error=%d",
         inet_ntoa(peer->ap_addr), error);
 
     return 0;
@@ -805,9 +1069,9 @@ int aurp_send_zi_req(struct aurp_peer *peer, uint16_t *nets, int count)
         return 0;  /* Nothing to request */
     }
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_ZI_REQ, 0);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_local_conn_id,
+                                   0, AURP_CMD_ZI_REQ, 0);
     if (n < 0) return -1;
     len += n;
 
@@ -838,9 +1102,7 @@ int aurp_send_zi_req(struct aurp_peer *peer, uint16_t *nets, int count)
         peer->ap_last_pkt_len = len;
     }
 
-    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
-
-    LOG(log_info, logtype_default, "aurp_send_zi_req: sent request for %d networks to %s",
+    LOG(log_info, logtype_atalkd, "aurp_send_zi_req: sent request for %d networks to %s",
         count, inet_ntoa(peer->ap_addr));
 
     return 0;
@@ -867,9 +1129,9 @@ int aurp_send_zi_rsp(struct aurp_peer *peer, int last)
         flags |= AURP_FLAG_LAST;
     }
 
-    /* Build header */
-    n = aurp_build_header(buf, sizeof(buf), peer->ap_local_conn_id,
-                          peer->ap_local_seq, AURP_CMD_ZI_RSP, flags);
+    /* Build routing header (domain + transport + command) */
+    n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_remote_conn_id,
+                                   0, AURP_CMD_ZI_RSP, flags);
     if (n < 0) return -1;
     len += n;
 
@@ -909,7 +1171,7 @@ int aurp_send_zi_rsp(struct aurp_peer *peer, int last)
 
             /* Check buffer space: network(2) + length(1) + name(n) */
             if (len + 3 + zt->zt_len > sizeof(buf)) {
-                LOG(log_warning, logtype_default,
+                LOG(log_warning, logtype_atalkd,
                     "aurp_send_zi_rsp: packet full, need multiple packets");
                 goto send;
             }
@@ -926,7 +1188,7 @@ int aurp_send_zi_rsp(struct aurp_peer *peer, int last)
 
             zone_count++;
 
-            LOG(log_debug, logtype_default,
+            LOG(log_debug, logtype_atalkd,
                 "aurp_send_zi_rsp: adding zone '%.*s' for network %u",
                 zt->zt_len, zt->zt_name, network);
         }
@@ -944,8 +1206,237 @@ send:
 
     peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
 
-    LOG(log_info, logtype_default, "aurp_send_zi_rsp: sent %u zones to %s (last=%d)",
+    LOG(log_info, logtype_atalkd, "aurp_send_zi_rsp: sent %u zones to %s (last=%d)",
         zone_count, inet_ntoa(peer->ap_addr), last);
+
+    return 0;
+}
+
+/*
+ * Data Forwarding Functions
+ */
+
+/*
+ * Find the AURP peer that provides a route to the given network
+ * Returns NULL if no AURP peer serves that network
+ */
+struct aurp_peer *aurp_find_peer_for_net(uint16_t net)
+{
+    struct aurp_peer *peer;
+    struct rtmptab *rt;
+
+    for (peer = aurp_config.ac_peers; peer != NULL; peer = peer->ap_next) {
+        /* Only consider connected peers */
+        if (peer->ap_recv_state != AURP_RECV_CONNECTED) {
+            continue;
+        }
+
+        /* Search through routes learned from this peer */
+        for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
+            uint16_t firstnet = ntohs(rt->rt_firstnet);
+            uint16_t lastnet = ntohs(rt->rt_lastnet);
+
+            if (net >= firstnet && net <= lastnet) {
+                return peer;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Handle incoming AURP data packet (encapsulated DDP)
+ * Parse the DDP header and forward to local AppleTalk network
+ */
+static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
+{
+    struct ddpehdr *ddp;
+    struct sockaddr_at sat;
+    struct interface *iface, *dest_iface = NULL;
+    struct atport *ap;
+    extern struct interface *interfaces;
+    uint16_t dst_net, src_net;
+    uint8_t dst_node, src_node, dst_socket;
+    int ddp_len;
+
+    /* Need at least the DDP header (12 bytes) + type (1 byte) */
+    if (len < 13) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_handle_data: packet too short (%d bytes)", len);
+        return;
+    }
+
+    /* Parse DDP extended header */
+    ddp = (struct ddpehdr *)data;
+    dst_net = ntohs(ddp->deh_dnet);
+    src_net = ntohs(ddp->deh_snet);
+    dst_node = ddp->deh_dnode;
+    src_node = ddp->deh_snode;
+    dst_socket = ddp->deh_dport;
+
+    /* Extract length from header (10 bits) */
+    ddp_len = ntohs(ddp->deh_bytes) & 0x3FF;
+    if (ddp_len < 13 || ddp_len > len) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_handle_data: invalid DDP length %d (packet len %d)",
+            ddp_len, len);
+        return;
+    }
+
+    LOG(log_debug, logtype_atalkd,
+        "aurp_handle_data: DDP %u.%u.%u -> %u.%u.%u len=%d",
+        src_net, src_node, ddp->deh_sport,
+        dst_net, dst_node, dst_socket, ddp_len);
+
+    /*
+     * Find the local interface for this network
+     * Node 0 means "any router for this network" - that's us
+     */
+    for (iface = interfaces; iface != NULL; iface = iface->i_next) {
+        if ((iface->i_flags & IFACE_CONFIG) == 0) {
+            continue;
+        }
+        if (iface->i_flags & IFACE_LOOPBACK) {
+            continue;
+        }
+        if (iface->i_rt == NULL) {
+            continue;
+        }
+
+        uint16_t firstnet = ntohs(iface->i_rt->rt_firstnet);
+        uint16_t lastnet = ntohs(iface->i_rt->rt_lastnet);
+
+        if (dst_net >= firstnet && dst_net <= lastnet) {
+            dest_iface = iface;
+            break;
+        }
+    }
+
+    if (dest_iface == NULL) {
+        LOG(log_debug, logtype_atalkd,
+            "aurp_handle_data: no local interface for network %u", dst_net);
+        return;
+    }
+
+    /*
+     * If destination node is 0, the packet is for "any router" on this network.
+     * This is typically used for NBP FwdReq. Check if it's NBP (socket 2).
+     */
+    if (dst_node == 0) {
+        uint8_t ddp_type;
+
+        ddp_type = (uint8_t)data[12];  /* DDP type follows 12-byte header */
+
+        if (dst_socket == 2 && ddp_type == DDPTYPE_NBP) {
+            /* NBP packet to router - could be FwdReq for name lookup */
+            LOG(log_debug, logtype_atalkd,
+                "aurp_handle_data: NBP packet to router on network %u", dst_net);
+            /* TODO: Handle NBP FwdReq - convert to BrRq and send on local network */
+        }
+        return;
+    }
+
+    /*
+     * Forward the DDP packet to the destination on the local network
+     * We use the interface's socket bound to the appropriate DDP socket
+     */
+    memset(&sat, 0, sizeof(sat));
+#ifdef BSD4_4
+    sat.sat_len = sizeof(struct sockaddr_at);
+#endif
+    sat.sat_family = AF_APPLETALK;
+    sat.sat_addr.s_net = htons(dst_net);
+    sat.sat_addr.s_node = dst_node;
+    sat.sat_port = dst_socket;
+
+    /* Find the appropriate port to send from */
+    for (ap = dest_iface->i_ports; ap != NULL; ap = ap->ap_next) {
+        /* Use the RTMP port (socket 1) for general forwarding */
+        if (ap->ap_port == 1) {
+            break;
+        }
+    }
+
+    if (ap == NULL) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_handle_data: no port available on interface %s",
+            dest_iface->i_name);
+        return;
+    }
+
+    /* Send the packet (skip DDP header, send from type byte onwards) */
+    if (sendto(ap->ap_fd, data + 12, len - 12, 0,
+               (struct sockaddr *)&sat, sizeof(sat)) < 0) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_handle_data: sendto(%u.%u) failed: %s",
+            dst_net, dst_node, strerror(errno));
+    } else {
+        LOG(log_debug, logtype_atalkd,
+            "aurp_handle_data: forwarded packet to %u.%u.%u",
+            dst_net, dst_node, dst_socket);
+    }
+}
+
+/*
+ * Send a DDP packet via AURP to the appropriate peer
+ * The data should be a raw DDP packet including the extended header
+ */
+int aurp_send_data(uint16_t dst_net, char *ddp_data, int ddp_len)
+{
+    char buf[AURP_MAX_PKT_SIZE];
+    struct aurp_peer *peer;
+    int len = 0;
+    int n;
+
+    /* Find the peer that serves this network */
+    peer = aurp_find_peer_for_net(dst_net);
+    if (peer == NULL) {
+        LOG(log_debug, logtype_atalkd,
+            "aurp_send_data: no AURP peer for network %u", dst_net);
+        return -1;
+    }
+
+    /* Only send if peer is connected */
+    if (peer->ap_recv_state != AURP_RECV_CONNECTED) {
+        LOG(log_debug, logtype_atalkd,
+            "aurp_send_data: peer %s not connected", inet_ntoa(peer->ap_addr));
+        return -1;
+    }
+
+    /* Check packet size */
+    if (ddp_len > AURP_MAX_PKT_SIZE - 50) {  /* Leave room for headers */
+        LOG(log_warning, logtype_atalkd,
+            "aurp_send_data: packet too large (%d bytes)", ddp_len);
+        return -1;
+    }
+
+    /* Build domain header for AppleTalk data packet */
+    n = aurp_build_domain_header(buf + len, sizeof(buf) - len, peer, AURP_PKT_APPLETALK);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Copy DDP packet data */
+    memcpy(buf + len, ddp_data, ddp_len);
+    len += ddp_len;
+
+    /* Send to peer */
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr = peer->ap_addr;
+    sin.sin_port = htons(aurp_config.ac_port);
+
+    if (sendto(aurp_fd, buf, len, 0, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_send_data: sendto(%s) failed: %s",
+            inet_ntoa(peer->ap_addr), strerror(errno));
+        return -1;
+    }
+
+    LOG(log_debug, logtype_atalkd,
+        "aurp_send_data: sent %d byte packet to %s for network %u",
+        len, inet_ntoa(peer->ap_addr), dst_net);
 
     return 0;
 }
@@ -972,5 +1463,5 @@ void aurp_shutdown(void)
     }
     aurp_config.ac_peers = NULL;
 
-    LOG(log_info, logtype_default, "AURP shutdown complete");
+    LOG(log_info, logtype_atalkd, "AURP shutdown complete");
 }

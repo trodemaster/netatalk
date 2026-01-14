@@ -633,15 +633,24 @@ aurp-peer 10.0.0.1            # Another peer
 5. [ ] GDZL-Req/GDZL-Rsp (GetDomainZoneList) - optional, not commonly used
 6. [ ] Test: Verify zones are learned from AURP peers
 
-### Phase 6: Data Forwarding
+### Phase 6: Data Forwarding [COMPLETED]
 
 **Goal**: Forward encapsulated AppleTalk packets
 
-1. Implement DDP packet encapsulation (AURP packet type 0x0002)
-2. Route encapsulated packets to local interfaces
-3. Encapsulate outbound packets for AURP peers
-4. Handle NBP FwdReq for cross-tunnel name lookups
-5. Test: Verify end-to-end AppleTalk connectivity through tunnel
+1. [x] Implement DDP packet encapsulation (AURP packet type 0x0002)
+2. [x] Route encapsulated packets to local interfaces
+3. [x] Encapsulate outbound packets for AURP peers
+4. [ ] Handle NBP FwdReq for cross-tunnel name lookups (TODO placeholder added)
+5. [ ] Test: Verify end-to-end AppleTalk connectivity through tunnel
+
+**Implementation Notes (Phase 6)**:
+- Fixed `aurp_input()` to properly parse domain header (RFC 1504 format)
+- Updated `aurp_build_domain_id()` and `aurp_parse_domain_id()` for correct RFC 1504 IP domain identifier format (8 bytes with distinguisher)
+- Added `aurp_build_domain_header()`, `aurp_build_routing_header()` helper functions
+- Updated all send functions to include proper domain headers
+- Implemented `aurp_handle_data()` for incoming DDP packets - parses extended DDP header and forwards to local network
+- Implemented `aurp_send_data()` for outgoing DDP packets - encapsulates in AURP AppleTalk packet type
+- Added `aurp_find_peer_for_net()` to locate AURP peer for a given network number
 
 ### Phase 7: Testing and Polish
 
@@ -786,8 +795,198 @@ To resume this implementation effort:
 6. [x] Phase 3 Complete: Peer state machine in aurp_peer.c
 7. [x] Phase 4 Complete: Route exchange (RI-Req/RI-Rsp/RI-Upd/RI-Ack/RD)
 8. [x] Phase 5 Complete: Zone information exchange (ZI-Req/ZI-Rsp)
-9. [ ] Phase 6 Pending: Data forwarding (DDP encapsulation)
+9. [x] Phase 6 Complete: Data forwarding (DDP encapsulation)
 10. [ ] Phase 7 Pending: Testing and polish
 
-**Current Status**: AURP service with full route and zone exchange. Ready for Phase 6 implementation (data forwarding).
+**Current Status**: AURP service with full route exchange, zone information, and data forwarding. Ready for Phase 7 (testing and polish).
+
+---
+
+## jrouter Reference Testing Findings (January 14, 2026)
+
+### Test Setup
+
+Captured reference AURP packets from jrouter v0.0.21-dev operating in seed mode on 192.168.0.214:387. jrouter successfully connected to multiple AURP peers and exchanged 26 zones (Airaga, BabCom, Cloudbusting, Digitopolis, etc.).
+
+### Packet Format Analysis
+
+Captured packets from `/tmp/aurp_reference2.pcap` and analyzed the Open-Req packet format:
+
+#### jrouter Open-Req Packet (33 bytes UDP payload)
+
+```
+Domain Header (22 bytes):
+  Dest DI:  07 01 00 00 [peer_ip]    (8 bytes - len=7, auth=1, dist=0, IP)
+  Src DI:   07 01 00 00 [local_ip]   (8 bytes)
+  Version:  00 01                     (2 bytes)
+  Reserved: 00 00                     (2 bytes)
+  PktType:  00 03                     (2 bytes = Routing)
+
+Transport Header (8 bytes):
+  ConnID:   [varies]                  (2 bytes)
+  Sequence: 00 00                     (2 bytes)
+  Command:  00 08                     (2 bytes = Open-Req)
+  Flags:    78 00                     (2 bytes = SUI+NA+ND+NC)
+
+Open-Req Data (3 bytes):
+  Version:  00 01                     (2 bytes = AURP v1)
+  OptCount: 00                        (1 byte = 0 options)
+```
+
+#### jrouter Open-Rsp Packet (36 bytes UDP payload)
+
+```
+Domain Header (22 bytes): same structure
+Transport Header (8 bytes): same structure with Command=00 09
+
+Open-Rsp Data (6 bytes):
+  RateOrErr: 00 01                    (2 bytes = rate 1, or error code if negative)
+  OptCount:  00                       (1 byte = 0 options)
+```
+
+### Critical Bug Found in netatalk AURP Implementation
+
+**Issue**: Option count field uses wrong size
+
+- **jrouter (correct)**: Uses 1 byte for option count
+- **netatalk (incorrect)**: Uses 2 bytes for option count
+
+```c
+// INCORRECT (netatalk current):
+uint16_t option_count = 0;
+memcpy(buf + len, &option_count, 2);  // 2 bytes
+len += 2;
+
+// CORRECT (should be):
+uint8_t option_count = 0;
+buf[len++] = option_count;            // 1 byte
+```
+
+This causes:
+- Open-Req to be 34 bytes instead of 33 bytes
+- Open-Rsp to be 35 bytes instead of 34 bytes
+- Peer routers may reject or misparse our packets
+
+### jrouter Source Code Reference
+
+From `/home/blake/code/jrouter/aurp/open.go`:
+
+```go
+type Options []OptionTuple
+
+func (o Options) WriteTo(w io.Writer) (int64, error) {
+    a := acc(w)
+    a.write8(uint8(len(o)))  // 1 byte for option count
+    for _, ot := range o {
+        a.writeTo(&ot)
+    }
+    return a.ret()
+}
+```
+
+### Other Observations
+
+1. **Domain Identifier Format**: Both implementations use 8-byte IP DI (len=7, auth=1, dist=0, IP[4]) - CORRECT
+
+2. **Transport Header**: Both use same format (ConnID, Seq, Cmd, Flags in network byte order) - CORRECT
+
+3. **Flags Value**: jrouter uses 0x7800 = SUI + NA + ND + NC flags - MATCHES our implementation
+
+4. **Connection ID**: jrouter generates random 16-bit connection IDs - our implementation does the same
+
+### Fixes Applied (January 14, 2026)
+
+1. **Fixed option count to use 1 byte instead of 2 bytes** in:
+   - `aurp_send_open_req()` - changed from `memcpy(&option_count, 2)` to `buf[len++] = 0`
+   - `aurp_send_open_rsp()` - same fix
+
+2. **Fixed domain identifier parsing in handlers**:
+   - `aurp_handle_open_req()` - removed redundant DI parsing (already parsed in `aurp_input()`)
+   - `aurp_handle_open_rsp()` - same fix; also fixed error code check from `!= 0` to `< 0`
+
+3. **Added comprehensive debug logging**:
+   - Changed all `logtype_default` to `logtype_atalkd`
+   - Added `aurp_hexdump()` for packet-level debugging at `log_debug9`
+   - Added command/state name helper functions for human-readable logs
+   - Enhanced packet dispatch logging with state machine info
+   - Added `aurp_log_status()` for periodic status summary (every 60 seconds)
+   - Enhanced zone handling logging to show addzone failures
+
+---
+
+## Current Implementation Status (January 14, 2026)
+
+### Working Features
+
+- **Connection establishment**: Open-Req/Open-Rsp handshake working correctly
+- **Route exchange**: RI-Req/RI-Rsp/RI-Ack working correctly
+- **Zone exchange**: ZI-Req/ZI-Rsp working correctly with SZI flag
+- **Keepalive**: Tickle/Tickle-Ack working correctly
+- **Verbose logging**: Comprehensive debug output for troubleshooting
+
+### Test Results
+
+With 17 AURP peers configured:
+- **4 peers connected** (63.228.98.61, 168.91.239.39, 173.62.241.229, 81.2.78.130)
+- **13 peers failed to connect** (offline or require bidirectional peering)
+- **5 zones visible**: SNAKSrV, PurrTopia, SuperK, billgoats [floppydisk], netjibbing (local)
+- **4 remote routes learned** (one per connected peer)
+
+### Logging Levels
+
+- `log_info`: Connection events, route/zone additions, status summary
+- `log_debug`: Packet dispatch, state transitions, detailed operations
+- `log_debug9`: Hex dumps of raw packets (for protocol debugging)
+
+### Log Example
+
+```
+aurp_input: RI-Rsp from 63.228.98.61 conn_id=9158 seq=1 flags=0x8000 data_len=6 recv_state=WAIT_RI_RSP send_state=UNCONNECTED
+aurp_handle_ri_rsp: learned route 4123-4124 dist 0 from 63.228.98.61
+aurp_handle_zi_rsp: ADDED zone 'SNAKSrV' to route 4123-4124
+=== AURP Status Summary ===
+  Peer 63.228.98.61: recv=CONNECTED send=UNCONNECTED routes=1 zones=1 conn_id=9158
+=== AURP Totals: 17 peers (4 connected), 4 routes, 4 zones ===
+```
+
+---
+
+## Resume Checklist (Updated)
+
+To resume this implementation effort:
+
+1. Review this document for current status
+2. Build: `meson compile -C build && sudo meson install -C build`
+3. Verify atalkd.conf has AURP peers configured (file may get truncated externally)
+4. Start service: `sudo systemctl restart atalkd`
+5. Check logs: `sudo journalctl -u atalkd -f`
+6. Test zones: `getzones`
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `etc/atalkd/aurp.c` | Added hex dump, command/state name helpers, enhanced logging |
+| `etc/atalkd/aurp.h` | Added `aurp_log_status()` declaration |
+| `etc/atalkd/aurp_peer.c` | Added status logging, enhanced zone parsing, periodic status output |
+
+### Known Issues / Future Work
+
+1. **Many peers offline**: Most peers from kalleboo.com/GT2024.txt don't respond (may require bidirectional peering)
+2. **NBP FwdReq**: Not implemented - TODO placeholder in `aurp_handle_data()`
+3. **GDZL**: GetDomainZoneList not implemented (rarely used)
+4. **Split horizon**: Each peer only advertises their local network, not AURP-learned routes (correct per RFC)
+
+### Test Configuration
+
+```
+# /home/blake/code/machine-cfg/macpro2013/atalkd.conf
+enp12s0 -router -phase 2 -net 650 -addr 650.37 -zone "netjibbing"
+
+aurp-peer 63.228.98.61
+aurp-peer 168.91.239.39
+aurp-peer 173.62.241.229
+aurp-peer 81.2.78.130
+# ... additional peers that may or may not respond
+```
 
