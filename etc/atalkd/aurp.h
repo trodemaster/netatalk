@@ -191,6 +191,7 @@ struct aurp_config {
     struct in_addr       ac_listen_addr;
     struct in_addr       ac_local_ip;       /* Our domain identifier */
     struct aurp_peer    *ac_peers;
+    char                *ac_peerlist_file;  /* Path to peer list file */
 };
 
 extern struct aurp_config aurp_config;
@@ -241,6 +242,10 @@ struct aurp_peer *aurp_peer_new(struct in_addr addr, const char *hostname);
 void aurp_peer_free(struct aurp_peer *peer);
 struct aurp_peer *aurp_peer_find(struct in_addr addr);
 struct aurp_peer *aurp_peer_find_or_create(struct in_addr addr);
+
+/* Peer list loading from file */
+int aurp_load_peerlist(const char *filepath);
+int aurp_parse_peerlist(const char *data, size_t len);
 
 /* Connection management */
 void aurp_peer_connect(struct aurp_peer *peer);

@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <netatalk/at.h>
+#include <netatalk/ddp.h>
 #include <atalk/ddp.h>
 #include <atalk/atp.h>
 #include <atalk/nbp.h>
@@ -34,6 +35,7 @@
 #include "zip.h"
 #include "nbp.h"
 #include "multicast.h"
+#include "aurp.h"
 
 extern int  transition;
 
@@ -500,6 +502,59 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     }
                 }
 
+                /* Check if this is an AURP route - needs tunnel forwarding */
+                if (rtmp->rt_flags & RTMPTAB_AURP) {
+                    /* Build extended DDP packet for AURP forwarding */
+                    char ddp_packet[ATP_BUFSIZ];
+                    struct ddpehdr *ddp_hdr = (struct ddpehdr *)ddp_packet;
+                    uint16_t dst_net = ntohs(sat.sat_addr.s_net);
+                    uint16_t total_len = len + 13;  /* DDP header + NBP data */
+
+                    if (total_len > sizeof(ddp_packet)) {
+                        LOG(log_error, logtype_atalkd, "nbp brrq: packet too large for AURP");
+                        continue;
+                    }
+
+                    /* Build extended DDP header */
+                    memset(ddp_hdr, 0, 13);
+
+                    /* Hop count (4 bits) + Length (10 bits) in network byte order */
+                    uint16_t hop_len = (0 << 10) | (total_len & 0x3FF);
+                    ddp_hdr->deh_bytes = htons(hop_len);
+
+                    /* Checksum (usually 0 for AURP) */
+                    ddp_hdr->deh_sum = 0;
+
+                    /* Destination */
+                    ddp_hdr->deh_dnet = sat.sat_addr.s_net;  /* Already in network order */
+                    ddp_hdr->deh_dnode = sat.sat_addr.s_node;
+                    ddp_hdr->deh_dport = sat.sat_port;
+
+                    /* Source (our local interface) */
+                    ddp_hdr->deh_snet = htons(ntohs(ap->ap_iface->i_rt->rt_firstnet));
+                    ddp_hdr->deh_snode = ap->ap_iface->i_rt->rt_gate ?
+                                         ap->ap_iface->i_rt->rt_gate->g_sat.sat_addr.s_node :
+                                         ap->ap_iface->i_addr.sat_addr.s_node;
+                    ddp_hdr->deh_sport = ap->ap_port;
+
+                    /* DDP Type */
+                    ddp_packet[12] = DDPTYPE_NBP;
+
+                    /* Copy NBP data after DDP header */
+                    memcpy(ddp_packet + 13, data - len, len);
+
+                    /* Forward through AURP tunnel */
+                    if (aurp_send_data(dst_net, ddp_packet, total_len) < 0) {
+                        LOG(log_debug, logtype_atalkd,
+                            "nbp brrq: AURP forward to net %u failed", dst_net);
+                    } else {
+                        LOG(log_debug, logtype_atalkd,
+                            "nbp brrq: forwarded to AURP network %u", dst_net);
+                    }
+                    continue;
+                }
+
+                /* Local route - use regular AppleTalk sendto() */
                 if (sendto(ap->ap_fd, data - len, len, 0,
                            (struct sockaddr *)&sat,
                            sizeof(struct sockaddr_at)) < 0) {

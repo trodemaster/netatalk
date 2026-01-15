@@ -1,0 +1,14 @@
+AURP Packet Capture Summary
+===========================
+Date: Wed Jan 14 21:23:54 UTC 2026
+Interface: enp12s0
+Duration: 300s
+Service: none
+
+Files:
+- Packet capture: aurp_20260114_212351.pcap
+- Text dump: aurp_20260114_212351.txt
+- jrouter log: jrouter_20260114_212351.log
+- atalkd log: atalkd_20260114_212351.log
+
+tcpdump: listening on enp12s0, link-type EN10MB (Ethernet), snapshot length 262144 bytes

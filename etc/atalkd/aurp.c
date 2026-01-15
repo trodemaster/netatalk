@@ -397,6 +397,28 @@ int aurp_init(struct aurp_config *cfg)
     LOG(log_info, logtype_atalkd, "AURP initialized on %s:%d",
         inet_ntoa(cfg->ac_listen_addr), cfg->ac_port);
 
+    /* Load peer list from file if configured */
+    if (cfg->ac_peerlist_file != NULL) {
+        int peers_added = aurp_load_peerlist(cfg->ac_peerlist_file);
+        if (peers_added < 0) {
+            LOG(log_error, logtype_atalkd,
+                "AURP: failed to load peer list from %s (continuing with manual peers)",
+                cfg->ac_peerlist_file);
+        } else if (peers_added == 0) {
+            LOG(log_warning, logtype_atalkd,
+                "AURP: no valid peers found in %s", cfg->ac_peerlist_file);
+        }
+    }
+
+    /* Check if we have any peers configured */
+    if (cfg->ac_peers == NULL) {
+        LOG(log_info, logtype_atalkd,
+            "AURP disabled: no peers configured");
+        close(sock);
+        aurp_fd = -1;
+        return -1;
+    }
+
     /* Initiate connections to configured peers */
     struct aurp_peer *peer;
     for (peer = cfg->ac_peers; peer != NULL; peer = peer->ap_next) {

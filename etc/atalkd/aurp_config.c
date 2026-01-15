@@ -34,6 +34,8 @@ int aurp_config_parse(char **argv)
 
     if (strcmp(argv[0], "aurp-peer") == 0) {
         return aurp_config_peer(argv);
+    } else if (strcmp(argv[0], "aurp-peerlist-file") == 0) {
+        return aurp_config_peerlist_file(argv);
     } else if (strcmp(argv[0], "aurp-port") == 0) {
         return aurp_config_port(argv);
     } else if (strcmp(argv[0], "aurp-listen") == 0) {
@@ -168,6 +170,33 @@ int aurp_config_open_peering(char **av)
     }
 
     aurp_config.ac_enabled = 1;
+
+    return 0;
+}
+
+/* Configure AURP peer list file */
+int aurp_config_peerlist_file(char **av)
+{
+    if (av[1] == NULL) {
+        fprintf(stderr, "aurp-peerlist-file: no file path specified\n");
+        return -1;
+    }
+
+    /* Free existing path if present */
+    if (aurp_config.ac_peerlist_file != NULL) {
+        free(aurp_config.ac_peerlist_file);
+    }
+
+    /* Store file path (will be loaded during aurp_init()) */
+    aurp_config.ac_peerlist_file = strdup(av[1]);
+    if (aurp_config.ac_peerlist_file == NULL) {
+        fprintf(stderr, "aurp-peerlist-file: out of memory\n");
+        return -1;
+    }
+
+    aurp_config.ac_enabled = 1;
+
+    LOG(log_info, logtype_default, "aurp-peerlist-file: set to %s", av[1]);
 
     return 0;
 }

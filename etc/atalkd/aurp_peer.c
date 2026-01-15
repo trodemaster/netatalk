@@ -15,11 +15,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <ctype.h>
 #include <netatalk/at.h>
 #include <atalk/logger.h>
 
@@ -169,6 +171,188 @@ struct aurp_peer *aurp_peer_find_or_create(struct in_addr addr)
     aurp_config.ac_peers = peer;
 
     return peer;
+}
+
+/*
+ * Peer list fetching from URL
+ */
+
+/* Parse peer list data (one IP/hostname per line) */
+int aurp_parse_peerlist(const char *data, size_t len)
+{
+    const char *line_start, *line_end;
+    char line[256];
+    int line_num = 0;
+    int peers_added = 0;
+    struct hostent *he;
+    struct in_addr addr;
+    struct aurp_peer *peer;
+
+    if (data == NULL || len == 0) {
+        return 0;
+    }
+
+    line_start = data;
+    while (line_start < data + len) {
+        line_num++;
+
+        /* Find end of line */
+        line_end = line_start;
+        while (line_end < data + len && *line_end != '\n' && *line_end != '\r') {
+            line_end++;
+        }
+
+        /* Extract line */
+        size_t line_len = line_end - line_start;
+        if (line_len >= sizeof(line)) {
+            LOG(log_warning, logtype_atalkd,
+                "aurp_parse_peerlist: line %d too long, skipping", line_num);
+            goto next_line;
+        }
+
+        memcpy(line, line_start, line_len);
+        line[line_len] = '\0';
+
+        /* Trim leading whitespace */
+        char *p = line;
+        while (*p && isspace(*p)) {
+            p++;
+        }
+
+        /* Skip empty lines and comments */
+        if (*p == '\0' || *p == '#') {
+            goto next_line;
+        }
+
+        /* Trim trailing whitespace */
+        char *end = p + strlen(p) - 1;
+        while (end > p && isspace(*end)) {
+            *end = '\0';
+            end--;
+        }
+
+        /* Try parsing as IP address first */
+        if (inet_aton(p, &addr) == 0) {
+            /* Try hostname resolution */
+            he = gethostbyname(p);
+            if (he == NULL) {
+                LOG(log_warning, logtype_atalkd,
+                    "aurp_parse_peerlist: line %d: cannot resolve '%s'", line_num, p);
+                goto next_line;
+            }
+            memcpy(&addr, he->h_addr, sizeof(addr));
+        }
+
+        /* Check if peer already exists */
+        if (aurp_peer_find(addr) != NULL) {
+            LOG(log_debug, logtype_atalkd,
+                "aurp_parse_peerlist: peer %s already configured, skipping", p);
+            goto next_line;
+        }
+
+        /* Create peer */
+        peer = aurp_peer_new(addr, p);
+        if (peer == NULL) {
+            LOG(log_error, logtype_atalkd,
+                "aurp_parse_peerlist: failed to create peer for '%s'", p);
+            goto next_line;
+        }
+
+        peer->ap_flags |= AURP_PEER_CONFIGURED;
+
+        /* Add to peer list */
+        peer->ap_next = aurp_config.ac_peers;
+        if (aurp_config.ac_peers != NULL) {
+            aurp_config.ac_peers->ap_prev = peer;
+        }
+        aurp_config.ac_peers = peer;
+
+        LOG(log_info, logtype_atalkd,
+            "aurp_parse_peerlist: added peer %s (%s)", p, inet_ntoa(addr));
+
+        peers_added++;
+
+next_line:
+        /* Skip to next line */
+        line_start = line_end;
+        while (line_start < data + len &&
+               (*line_start == '\n' || *line_start == '\r')) {
+            line_start++;
+        }
+    }
+
+    LOG(log_info, logtype_atalkd,
+        "aurp_parse_peerlist: added %d peers from list (%d lines processed)",
+        peers_added, line_num);
+
+    return peers_added;
+}
+
+/* Load peer list from file */
+int aurp_load_peerlist(const char *filepath)
+{
+    FILE *fp;
+    char *data = NULL;
+    size_t size = 0;
+    size_t capacity = 4096;
+    size_t nread;
+    int peers_added = 0;
+
+    if (filepath == NULL) {
+        return -1;
+    }
+
+    LOG(log_info, logtype_atalkd, "aurp_load_peerlist: loading from %s", filepath);
+
+    fp = fopen(filepath, "r");
+    if (fp == NULL) {
+        LOG(log_error, logtype_atalkd,
+            "aurp_load_peerlist: failed to open %s: %s", filepath, strerror(errno));
+        return -1;
+    }
+
+    /* Read entire file into memory */
+    data = malloc(capacity);
+    if (data == NULL) {
+        LOG(log_error, logtype_atalkd, "aurp_load_peerlist: out of memory");
+        fclose(fp);
+        return -1;
+    }
+
+    while ((nread = fread(data + size, 1, capacity - size, fp)) > 0) {
+        size += nread;
+        if (size == capacity) {
+            capacity *= 2;
+            char *new_data = realloc(data, capacity);
+            if (new_data == NULL) {
+                LOG(log_error, logtype_atalkd, "aurp_load_peerlist: out of memory");
+                free(data);
+                fclose(fp);
+                return -1;
+            }
+            data = new_data;
+        }
+    }
+
+    fclose(fp);
+
+    /* Parse the file contents */
+    if (size > 0) {
+        peers_added = aurp_parse_peerlist(data, size);
+    }
+
+    free(data);
+
+    if (peers_added > 0) {
+        LOG(log_info, logtype_atalkd,
+            "aurp_load_peerlist: successfully loaded %d peers from %s",
+            peers_added, filepath);
+    } else {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_load_peerlist: no valid peers found in %s", filepath);
+    }
+
+    return peers_added;
 }
 
 /*
