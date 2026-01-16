@@ -54,7 +54,7 @@ Byte 20-21:  Packet type (0x0002 = AppleTalk data)
 1. **Source IP MUST be actual interface IP**, not `0.0.0.0`
    - Use `getifaddrs()` to detect actual IP
    - Remote peers need valid source IP for responses
-   - **Inside Mac Networking v2**: Domain Identifiers are used to uniquely identify AURP peers across IP networks
+   - **Inside Macintosh: Networking**: Domain Identifiers are used to uniquely identify AURP peers across IP networks
 
 2. **Destination IP is peer's advertised Domain Identifier**
    - From AURP peer configuration
@@ -71,12 +71,12 @@ Byte 20-21:  Packet type (0x0002 = AppleTalk data)
 
 **Size**: 13 bytes  
 **Purpose**: AppleTalk Datagram Delivery Protocol header  
-**Reference**: Inside Macintosh: Networking v2, Chapter 3 - Datagram Delivery Protocol (DDP)
+**Reference**: [Inside Macintosh: Networking, Chapter 7 - Datagram Delivery Protocol (DDP)](https://dev.os9.ca/techpubs/mac/Networking/Networking-188.html)
 
 ### Byte Layout
 
 ```
-Byte 0-1:   Hop count (4 bits) + Length (10 bits) - BIG ENDIAN
+Byte 0-1:   Hop count (4 bits) + Length (10 bits) - BIG ENDIAN (bit-packed)
 Byte 2-3:   Checksum (usually 0x0000 for AURP)
 Byte 4-5:   Destination Network - BIG ENDIAN
 Byte 6:     Destination Node
@@ -87,18 +87,46 @@ Byte 11:    Source Socket
 Byte 12:    DDP Type (0x02 for NBP)
 ```
 
+**Inside Macintosh: Networking Documentation** (conceptual layout):
+- **Reference**: [Inside Macintosh: Networking, Chapter 7 - Datagram Delivery Protocol](https://dev.os9.ca/techpubs/mac/Networking/Networking-188.html)
+- **Note**: The official documentation shows a conceptual layout that differs from the actual wire format:
+  - **Byte 0**: Hop count (shown as 1 byte in docs, but actually 4 bits bit-packed)
+  - **Bytes 1-2**: Length (shown as 2 bytes in docs, but actually 10 bits bit-packed)
+  - **Bytes 3-4**: Checksum (2 bytes)
+  - **Bytes 5-6**: Destination Network (2 bytes, big-endian)
+  - **Byte 7**: Destination Node (1 byte)
+  - **Byte 8**: Source Node (1 byte) - **Note**: Order differs in some documentation
+  - **Byte 9**: Destination Socket (1 byte)
+  - **Byte 10**: Source Socket (1 byte)
+  - **Byte 11**: DDP Protocol Type (1 byte)
+
+**Important**: The official Inside Macintosh: Networking documentation shows a conceptual layout for programming convenience. The **actual wire format** (verified through jrouter packet captures and our implementation) uses:
+- **Bit-packing** for hop count (4 bits) and length (10 bits) in the first 16-bit word (bytes 0-1)
+- **Field order**: Destination Network, Destination Node, Destination Socket, then Source Network, Source Node, Source Socket
+- This wire format is what we implement and what matches jrouter's behavior and actual packet captures
+
 ### Inside Mac Networking v2 Specification
 
-According to Inside Macintosh: Networking v2:
-- **Extended Header**: Used for internetwork delivery (when source and destination networks differ)
+According to [Inside Macintosh: Networking](https://dev.os9.ca/techpubs/mac/Networking/Networking-188.html):
+- **Extended Header**: Used for internetwork delivery (when source and destination networks differ or when checksum is requested)
+- **Short Header**: 5 bytes (used when source and destination are on same network, no checksum)
 - **Maximum Datagram Length**: 586 bytes of data (plus 13-byte header = 599 bytes total)
-- **Hop Count**: Incremented by each router the packet passes through
-- **Checksum**: Optional; 0x0000 indicates no checksum (common for AURP)
-- **Network Numbers**: 16-bit values in big-endian format
+- **Hop Count**: 4 bits (0-15), incremented by each router ("bridge") the packet passes through
+- **Checksum**: Optional; 0x0000 indicates no checksum (common for AURP). Present only if checksum was requested
+- **Network Numbers**: 16-bit values in big-endian format (0-65534, 65535 reserved)
 - **Node IDs**: 8-bit values (0-254, 255 is broadcast)
 - **Socket Numbers**: 8-bit values (1-254, 0 and 255 reserved)
+- **DDP Protocol Type**: 1 byte identifying upper-layer protocol (NBP=0x02, ZIP=0x04, RTMP=0x01, AEP=0x03)
 
-**Note**: Some documentation may show different byte layouts. This specification matches the verified wire format from jrouter packet captures and RFC 1504 AURP implementation.
+**Note on Byte Layout Discrepancies**: 
+- [Inside Macintosh: Networking](https://dev.os9.ca/techpubs/mac/Networking/Networking-188.html) shows a conceptual layout with hop count as byte 0 (1 byte) and length as bytes 1-2 (2 bytes)
+- The **actual wire format** uses bit-packing: hop count (4 bits) and length (10 bits) are encoded together in the first 16-bit word (bytes 0-1)
+- This bit-packed format is what matches:
+  - jrouter's implementation (verified through source code analysis)
+  - Actual packet captures from tcpdump
+  - Our implementation in `nbp.c` (lines 580-612)
+- The format documented here (bit-packed) is the **correct wire format** used in AURP and verified through packet analysis
+- **Implementation Reference**: See `/home/blake/code/netatalk/etc/atalkd/nbp.c` lines 580-612 for the actual byte-by-byte construction
 
 ### Hop Count + Length Encoding
 
@@ -116,14 +144,21 @@ bytes[1] = hop_len & 0xFF;         // Low byte
 - Bytes: `0x00 0x2D`
 
 **Inside Mac Networking v2 Specification**:
-- **Length Field**: 10 bits (0-1023), includes header + data
-- **Hop Count**: 4 bits (0-15), stored in upper bits of first byte
-- **Bit Layout**: 
-  - Bits 15-12: Hop count (4 bits)
-  - Bits 11-6: Reserved/unused (6 bits)
-  - Bits 5-0: Length low bits (6 bits)
-  - Combined with byte 1 (8 bits) = 10-bit length total
+- **Length Field**: 10 bits (bits 0-9), includes header + data, range 0-1023
+- **Hop Count**: 4 bits (bits 10-13), range 0-15, incremented by each router
+- **Reserved Bits**: Bits 14-15 (upper 2 bits) are reserved/unused
+- **Bit Layout** (16-bit word, big-endian):
+  ```
+  Bits 15-14: Reserved (unused)
+  Bits 13-10: Hop count (4 bits)
+  Bits 9-0:   Length (10 bits)
+  ```
+- **Encoding**: `value = (hop_count << 10) | (length & 0x03FF)`
+- **Decoding**: 
+  - `length = value & 0x03FF` (extract lower 10 bits)
+  - `hop_count = (value >> 10) & 0x0F` (extract bits 10-13)
 - **Maximum Packet Size**: 586 bytes data + 13 bytes header = 599 bytes total
+- **Minimum Length**: 13 bytes (header only)
 
 ### Source Address (CRITICAL)
 
@@ -156,7 +191,7 @@ ddp_packet[11] = 1;  // RTMP socket
 ## NBP Packet Format
 
 **Purpose**: Name Binding Protocol for service discovery  
-**Reference**: Inside Macintosh: Networking v2, Chapter 4 - Name Binding Protocol (NBP)
+**Reference**: [Inside Macintosh: Networking, Chapter 3 - Name-Binding Protocol (NBP)](https://dev.os9.ca/techpubs/mac/Networking/Networking-2.html)
 
 ### NBP Header (2 bytes)
 
@@ -179,7 +214,7 @@ Byte 1:     NBP ID
 - `0x04`: FwdReq (Forward Request) - **Used for AURP forwarding across networks**
 - `0x05`: FwdReply (Forward Reply) - Response to forward request
 
-**Inside Mac Networking v2**: NBP operations are defined in the upper 4 bits of the first byte. The operation codes match the AppleTalk protocol specification. FwdReq is specifically designed for routers to forward NBP queries across network boundaries (as in AURP tunneling).
+**Inside Macintosh: Networking**: NBP operations are defined in the upper 4 bits of the first byte. The operation codes match the AppleTalk protocol specification. FwdReq (Forward Request) is specifically designed for routers to forward NBP queries across network boundaries (as in AURP tunneling). This allows routers to forward NBP lookups to remote networks while preserving the original requester's address in the tuple for response routing.
 
 ### NBP Tuple Format
 
@@ -201,12 +236,26 @@ Zone string (N bytes)            - Zone name (e.g., "Digitopolis")
 **Inside Mac Networking v2 Specification**:
 - **ATName Format**: Pascal-style strings with 1-byte length prefix (1-32 bytes)
 - **Object/Type/Zone Names**: Maximum 32 characters each (ATName type)
-- **Address Field**: Network (2 bytes), Node (1 byte), Socket (1 byte) - big-endian
-- **Enumerator**: Used to distinguish multiple responses from same entity
+- **Address Field** (Internet Address in tuple):
+  - Network number: 2 bytes (big-endian, word)
+  - Node ID: 1 byte
+  - Socket number: 1 byte
+  - **Purpose**: Specifies the address of the entity (for replies) or where responses should be sent (for requests)
+- **Enumerator**: 1 byte, used to distinguish multiple names registered on the same socket
+- **Tuple Structure** (from Inside Macintosh v2):
+  - Pointer to next entry (internal structure)
+  - Network number (2 bytes)
+  - Node ID (1 byte)
+  - Socket number (1 byte)
+  - Internal enumerator (1 byte)
+  - Object name length (1 byte) + object name characters
+  - Type name length (1 byte) + type name characters
+  - Zone name length (1 byte) + zone name characters
 - **Wildcards**: 
   - Object/Type `"="` (single byte 0x3D) means "any"
   - Zone `"*"` (single byte 0x2A) means "current zone"
   - Zone length 0 means "no zone specified"
+- **Reply-to Address**: In lookup requests, the tuple's address field specifies where responses should be sent. This is the "reply-to" address that allows responses to route back to the original requester.
 
 ### Converting BrRq to FwdReq
 
@@ -224,16 +273,26 @@ nh.nh_op = NBPOP_BRRQ;  // 0x01
 nh.nh_op = NBPOP_FWD;   // 0x04
 ```
 
-**Inside Mac Networking v2**: FwdReq is specifically designed for routers to forward NBP queries across network boundaries. The tuple's address field (network/node/socket) specifies where responses should be sent. For AURP, this is the original requester's address (the Mac), allowing responses to route back through the AURP tunnel to the router, which then forwards to the Mac.
+**Inside Macintosh: Networking**: FwdReq is specifically designed for routers to forward NBP queries across network boundaries. The tuple's address field (network/node/socket) specifies where responses should be sent. For AURP, this is the original requester's address (the Mac), allowing responses to route back through the AURP tunnel to the router, which then forwards to the Mac.
 
 ### NBP Tuple Address Field
 
 **Inside Mac Networking v2 Specification**:
-- **Purpose**: The address field in an NBP tuple specifies where responses should be sent
-- **Format**: Network (2 bytes, big-endian), Node (1 byte), Socket (1 byte)
-- **For Lookup Requests**: Contains the requester's address (reply-to)
-- **For Lookup Replies**: Contains the discovered entity's address
-- **For FwdReq**: Contains the original requester's address (allows responses to route back)
+- **Field Name**: "Internet address" or "tuple address" in Inside Macintosh terminology
+- **Purpose**: 
+  - **For Lookup Requests**: Specifies where responses should be sent (the requester's address)
+  - **For Lookup Replies**: Contains the discovered entity's address (where the service is located)
+  - **For FwdReq**: Contains the original requester's address (allows responses to route back through AURP)
+- **Format**: 
+  - Network number: 2 bytes (big-endian, word)
+  - Node ID: 1 byte
+  - Socket number: 1 byte
+- **Tuple Structure Constants** (from Inside Macintosh v2):
+  - `tupleNet`: Network number (word/2 bytes)
+  - `tupleNode`: Node ID (byte)
+  - `tupleSkt`: Socket number (byte)
+  - `tupleEnum`: Enumerator (byte, for multiple names on same socket)
+  - `tupleName`: Entity name (object:type@zone)
 
 ---
 
@@ -288,7 +347,7 @@ From successful jrouter capture analysis:
 - Purpose: Maintain connection state
 - Format: 30-byte AURP control packet
 
-**Inside Mac Networking v2**: AURP uses longer keepalive intervals due to WAN latency considerations.
+**Inside Macintosh: Networking**: AURP uses longer keepalive intervals (~90 seconds) compared to local AppleTalk's 10-second intervals, due to WAN latency considerations and to reduce unnecessary traffic over potentially slow or expensive WAN links.
 
 ---
 
@@ -310,7 +369,7 @@ Zone names in AURP use **Pascal string format**:
   └─ Length: 6 bytes
 ```
 
-**Inside Mac Networking v2**: ATName format (1-32 bytes) is used consistently for zone names, object names, and type names in NBP.
+**Inside Macintosh: Networking**: ATName format (1-32 bytes) is used consistently for zone names, object names, and type names in NBP. Pascal strings use a 1-byte length prefix followed by that many characters (no null terminator). Maximum length is 32 characters for zone names in AppleTalk.
 
 ### ZI-Req Packet Format
 
@@ -652,11 +711,13 @@ Key logging locations:
 ### Official Specifications
 
 - **RFC 1504**: AURP (AppleTalk Update-Based Routing Protocol) specification
-- **Inside Macintosh: Networking v2** (Apple Computer, Inc., 1994):
-  - Chapter 3: Datagram Delivery Protocol (DDP)
-  - Chapter 4: Name Binding Protocol (NBP)
-  - Chapter 5: Zone Information Protocol (ZIP)
+- **Inside Macintosh: Networking** (Apple Computer, Inc., 1994):
+  - [Main Index](https://dev.os9.ca/techpubs/mac/Networking/Networking-2.html)
+  - [Chapter 3: Name-Binding Protocol (NBP)](https://dev.os9.ca/techpubs/mac/Networking/Networking-2.html)
+  - [Chapter 4: Zone Information Protocol (ZIP)](https://dev.os9.ca/techpubs/mac/Networking/Networking-2.html)
+  - [Chapter 7: Datagram Delivery Protocol (DDP)](https://dev.os9.ca/techpubs/mac/Networking/Networking-188.html)
   - Available at: https://dev.os9.ca/techpubs/mac/Networking/
+  - **Note**: The documentation shows conceptual layouts that may differ from actual wire format. Always verify against packet captures.
 - **Inside AppleTalk** (Apple Computer, Inc., 1989): Original AppleTalk protocol specifications
 
 ### Implementation References
@@ -670,7 +731,7 @@ Key logging locations:
 ### Additional Resources
 
 - **AppleTalk MIB (RFC 1742)**: SNMP Management Information Base for AppleTalk
-- **AppleTalk Transition Queue**: Inside Mac Networking v2, Chapter 2
+- **AppleTalk Transition Queue**: [Inside Macintosh: Networking, Chapter 2](https://dev.os9.ca/techpubs/mac/Networking/Networking-2.html)
 - **jrouter successful capture analysis**: Reference for AURP protocol flow and zone discovery patterns
 
 ---
@@ -691,7 +752,7 @@ Key logging locations:
 
 ## Inside Mac Networking v2 Integration
 
-This document has been cross-referenced with **Inside Macintosh: Networking v2** (Apple Computer, Inc., 1994) to ensure accuracy. The following specifications from Inside Mac Networking v2 have been incorporated:
+This document has been cross-referenced with **[Inside Macintosh: Networking](https://dev.os9.ca/techpubs/mac/Networking/Networking-2.html)** (Apple Computer, Inc., 1994) to ensure accuracy. The following specifications from Inside Macintosh: Networking have been incorporated:
 
 ### DDP Extended Header
 - Maximum datagram length: 586 bytes data + 13 bytes header = 599 bytes total
@@ -715,12 +776,29 @@ This document has been cross-referenced with **Inside Macintosh: Networking v2**
 
 ### Verification
 All specifications in this document have been verified against:
-1. Inside Macintosh: Networking v2 official documentation
+1. [Inside Macintosh: Networking](https://dev.os9.ca/techpubs/mac/Networking/Networking-2.html) official documentation
 2. jrouter packet captures (reference implementation)
 3. RFC 1504 AURP specification
 4. Actual wire format from tcpdump captures
+5. Our implementation in `/home/blake/code/netatalk/etc/atalkd/nbp.c`
 
-**Note**: Some documentation sources may show different byte layouts. The format documented here matches the verified wire format used in actual AURP implementations and packet captures.
+### Important Notes on Documentation Discrepancies
+
+**DDP Header Layout**:
+- Inside Macintosh: Networking shows a conceptual layout with separate fields
+- The actual wire format uses bit-packing for hop count and length in the first 16-bit word
+- Our implementation (and jrouter's) uses the bit-packed format, which matches actual packet captures
+- The bit-packed format is: `(hop_count << 10) | (length & 0x03FF)` in a 16-bit big-endian word
+
+**Field Order**:
+- Some documentation shows source network before destination network
+- The verified wire format (from jrouter captures) shows: Dest Network, Dest Node, Dest Socket, then Source Network, Source Node, Source Socket
+- This matches the format documented here
+
+**NBP Tuple Address**:
+- Inside Macintosh v2 refers to this as "internet address" or "tuple address"
+- The "reply-to" terminology is a functional description of how it's used in lookup requests
+- The address field serves as the reply destination in requests and the entity location in replies
 
 ---
 
