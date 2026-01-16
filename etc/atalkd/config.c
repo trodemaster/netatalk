@@ -235,6 +235,17 @@ int writeconf(char *cf)
             continue;
         }
 
+        /* Preserve AURP configuration lines */
+        if (conf != NULL && argv != NULL && strncmp(argv[0], "aurp-", 5) == 0) {
+            if (fputs(line, newconf) == EOF) {
+                LOG(log_error, logtype_atalkd, "fputs: %s", strerror(errno));
+                freeline(argv);
+                return -1;
+            }
+            freeline(argv);
+            continue;
+        }
+
         /* write real lines */
         if (iface) {
             fprintf(newconf, "%s", iface->i_name);

@@ -489,11 +489,20 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     sat.sat_addr.s_node = ATADDR_BCAST;
                 } else {
                     if (rtmp->rt_gate == NULL) {
-                        nh.nh_op = NBPOP_LKUP;
-                        memcpy(nbpop, &nh, SZ_NBPHDR);
-                        sat.sat_addr.s_net = 0;
-                        sat.sat_addr.s_node = ATADDR_BCAST;
-                        locallkup = 1;
+                        /* AURP routes have no gate but use IP tunnels */
+                        if (rtmp->rt_flags & RTMPTAB_AURP) {
+                            nh.nh_op = NBPOP_FWD;
+                            memcpy(nbpop, &nh, SZ_NBPHDR);
+                            sat.sat_addr.s_net = rtmp->rt_firstnet;
+                            sat.sat_addr.s_node = 0;  /* Router on that network */
+                        } else {
+                            /* Local route without gateway */
+                            nh.nh_op = NBPOP_LKUP;
+                            memcpy(nbpop, &nh, SZ_NBPHDR);
+                            sat.sat_addr.s_net = 0;
+                            sat.sat_addr.s_node = ATADDR_BCAST;
+                            locallkup = 1;
+                        }
                     } else {
                         nh.nh_op = NBPOP_FWD;
                         memcpy(nbpop, &nh, SZ_NBPHDR);
@@ -505,46 +514,116 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                 /* Check if this is an AURP route - needs tunnel forwarding */
                 if (rtmp->rt_flags & RTMPTAB_AURP) {
                     /* Build extended DDP packet for AURP forwarding */
-                    char ddp_packet[ATP_BUFSIZ];
-                    struct ddpehdr *ddp_hdr = (struct ddpehdr *)ddp_packet;
+                    unsigned char ddp_packet[ATP_BUFSIZ];
                     uint16_t dst_net = ntohs(sat.sat_addr.s_net);
-                    uint16_t total_len = len + 13;  /* DDP header + NBP data */
+                    uint16_t src_net = ntohs(from->sat_addr.s_net);
+                    
+                    /* Calculate NBP data length from current position to end of packet
+                     * nbpop points to NBP header (after DDP type was consumed)
+                     * end points to end of received packet */
+                    int nbp_data_len = end - nbpop;
+                    uint16_t total_len = 13 + nbp_data_len;  /* 13-byte DDP header + NBP data */
+                    
+                    /* Parse NBP tuple address (after 2-byte NBP header) */
+                    unsigned char *tuple_start = (unsigned char *)(nbpop + 2);
+                    uint16_t tuple_net = (tuple_start[0] << 8) | tuple_start[1];
+                    uint8_t tuple_node = tuple_start[2];
+                    uint8_t tuple_socket = tuple_start[3];
+                    
+                    /* CRITICAL: Use ORIGINAL Mac requester's address as DDP source
+                     * Per jrouter analysis: "MUST be the original Mac requester's address, NOT the router's address"
+                     * Remote servers will route responses back through AURP to reach the original requester
+                     * Note: from->sat_addr.s_net is already in network byte order, so use it directly */
+                    uint16_t src_net_be = ntohs(from->sat_addr.s_net);  /* Convert to host for logging, but we'll use network order */
+                    /* Actually, we need network byte order for the packet, so use from->sat_addr.s_net directly */
+                    /* Or convert host-order src_net back to network order with htons() */
+                    LOG(log_error, logtype_atalkd,
+                        "DEBUG NBP TUPLE: from %u.%u.%u, tuple says respond to %u.%u.%u",
+                        src_net, from->sat_addr.s_node, from->sat_port,
+                        tuple_net, tuple_node, tuple_socket);
+                    uint16_t router_net_host = ntohs(ap->ap_iface->i_addr.sat_addr.s_net);
+                    LOG(log_error, logtype_atalkd,
+                        "DEBUG DDP SOURCE: Using ROUTER address %u.%u.1 (per jrouter packet analysis)",
+                        router_net_host, ap->ap_iface->i_addr.sat_addr.s_node);
+                    
+                    /* DEBUG: Show the full NBP data bytes before sending */
+                    char hex_buf[256];
+                    int hex_pos = 0;
+                    for (int i = 0; i < (nbp_data_len < 20 ? nbp_data_len : 20); i++) {
+                        hex_pos += sprintf(hex_buf + hex_pos, "%02x ", (unsigned char)nbpop[i]);
+                    }
+                    LOG(log_error, logtype_atalkd,
+                        "DEBUG NBP DATA HEX (first %d bytes): %s",
+                        (nbp_data_len < 20 ? nbp_data_len : 20), hex_buf);
+                    
+                    LOG(log_error, logtype_atalkd,
+                        "DEBUG: AURP path executing! nbp_data_len=%d total_len=%d len=%d",
+                        nbp_data_len, total_len, len);
+
+                    /* Skip if destination network is 0 (local broadcast) */
+                    if (dst_net == 0) {
+                        LOG(log_debug, logtype_atalkd, "nbp brrq: skipping local broadcast (net 0)");
+                        continue;
+                    }
 
                     if (total_len > sizeof(ddp_packet)) {
                         LOG(log_error, logtype_atalkd, "nbp brrq: packet too large for AURP");
                         continue;
                     }
 
-                    /* Build extended DDP header */
-                    memset(ddp_hdr, 0, 13);
+                    /* Build extended DDP header manually in correct byte order
+                     * The struct ddpehdr has fields in wrong order for wire format! */
+                    int pos = 0;
 
-                    /* Hop count (4 bits) + Length (10 bits) in network byte order */
+                    /* Bytes 0-1: Hop count (4 bits) + Length (10 bits) in BIG ENDIAN */
                     uint16_t hop_len = (0 << 10) | (total_len & 0x3FF);
-                    ddp_hdr->deh_bytes = htons(hop_len);
+                    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;  /* High byte */
+                    ddp_packet[pos++] = hop_len & 0xFF;         /* Low byte */
 
-                    /* Checksum (usually 0 for AURP) */
-                    ddp_hdr->deh_sum = 0;
+                    /* Bytes 2-3: Checksum (0x0000) */
+                    ddp_packet[pos++] = 0x00;
+                    ddp_packet[pos++] = 0x00;
 
-                    /* Destination */
-                    ddp_hdr->deh_dnet = sat.sat_addr.s_net;  /* Already in network order */
-                    ddp_hdr->deh_dnode = sat.sat_addr.s_node;
-                    ddp_hdr->deh_dport = sat.sat_port;
+                    /* Bytes 4-5: Destination Network (big-endian) */
+                    ddp_packet[pos++] = (dst_net >> 8) & 0xFF;
+                    ddp_packet[pos++] = dst_net & 0xFF;
 
-                    /* Source (our local interface) */
-                    ddp_hdr->deh_snet = htons(ntohs(ap->ap_iface->i_rt->rt_firstnet));
-                    ddp_hdr->deh_snode = ap->ap_iface->i_rt->rt_gate ?
-                                         ap->ap_iface->i_rt->rt_gate->g_sat.sat_addr.s_node :
-                                         ap->ap_iface->i_addr.sat_addr.s_node;
-                    ddp_hdr->deh_sport = ap->ap_port;
+                    /* Byte 6: Destination Node */
+                    ddp_packet[pos++] = sat.sat_addr.s_node;
 
-                    /* DDP Type */
-                    ddp_packet[12] = DDPTYPE_NBP;
+                    /* Byte 7: Destination Socket */
+                    ddp_packet[pos++] = sat.sat_port;
 
-                    /* Copy NBP data after DDP header */
-                    memcpy(ddp_packet + 13, data - len, len);
+                    /* Bytes 8-9: Source Network (big-endian) - ROUTER'S ADDRESS!
+                     * Per jrouter packet analysis: DDP source uses ROUTER's address (73.2.252),
+                     * while NBP tuple reply-to uses Mac's address (650.73.252).
+                     * Responses come to router, which forwards to Mac based on NBP tuple.
+                     * Use router's interface address (already computed above). */
+                    ddp_packet[pos++] = (router_net_host >> 8) & 0xFF;  /* High byte */
+                    ddp_packet[pos++] = router_net_host & 0xFF;        /* Low byte */
+
+                    /* Byte 10: Source Node - ROUTER'S ADDRESS! */
+                    ddp_packet[pos++] = ap->ap_iface->i_addr.sat_addr.s_node;
+
+                    /* Byte 11: Source Socket - Use RTMP socket (1) for router */
+                    ddp_packet[pos++] = 1;  /* RTMP socket */
+
+                    /* Byte 12: DDP Type (NBP = 0x02) */
+                    ddp_packet[pos++] = DDPTYPE_NBP;
+
+                    /* Copy NBP data after DDP header
+                     * 'nbpop' points to NBP header (operation code was updated to FwdReq)
+                     * 'end' points to end of received packet
+                     * This includes: NBP header (2 bytes) + NBP tuples */
+                    memcpy(ddp_packet + pos, nbpop, nbp_data_len);
+
+                    /* DEBUG: Verify DDP packet construction */
+                    LOG(log_error, logtype_atalkd,
+                        "DEBUG DDP: pos=%d bytes[0-1]=%02x%02x bytes[12]=%02x total_len=%d",
+                        pos, ddp_packet[0], ddp_packet[1], ddp_packet[12], total_len);
 
                     /* Forward through AURP tunnel */
-                    if (aurp_send_data(dst_net, ddp_packet, total_len) < 0) {
+                    if (aurp_send_data(dst_net, (char *)ddp_packet, total_len) < 0) {
                         LOG(log_debug, logtype_atalkd,
                             "nbp brrq: AURP forward to net %u failed", dst_net);
                     } else {
@@ -735,6 +814,52 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
             }
         }
 
+        break;
+
+    case NBPOP_LKUPREPLY :
+        /*
+         * This is a Lookup Reply, typically from a remote AFP server responding
+         * to our NBP FwdReq. The reply is addressed to us (the router) because
+         * we used our address as the DDP source in the FwdReq.
+         * 
+         * We need to forward this reply to the original requester (the Mac).
+         * The original requester's address is in the NBP tuple's reply-to field.
+         */
+        LOG(log_error, logtype_atalkd,
+            "*** NBPOP_LKUPREPLY RECEIVED! from %u.%u.%u, ID=%u, count=%u, len=%d ***",
+            ntohs(from->sat_addr.s_net), from->sat_addr.s_node, from->sat_port,
+            nh.nh_id, nh.nh_cnt, len);
+        
+        /* Simply forward the packet to the address it came from
+         * (which should be the local Mac that sent the original BrRq).
+         * The NBP tuple contains the correct reply-to address.
+         * 
+         * For now, just re-broadcast it on the local network so the Mac can pick it up.
+         * The NBP protocol on the Mac side will match the ID and process it.
+         */
+        if (ap->ap_iface->i_flags & IFACE_ISROUTER) {
+            struct sockaddr_at reply_dest;
+            
+#ifdef BSD4_4
+            reply_dest.sat_len = sizeof(struct sockaddr_at);
+#endif
+            reply_dest.sat_family = AF_APPLETALK;
+            reply_dest.sat_addr.s_net = 0;  /* Network 0 = broadcast on this network */
+            reply_dest.sat_addr.s_node = ATADDR_BCAST;  /* Broadcast to all nodes */
+            reply_dest.sat_port = ap->ap_port;
+            
+            /* Forward the Lookup Reply as-is to the local network */
+            if (sendto(ap->ap_fd, data - len, len, 0,
+                       (struct sockaddr *)&reply_dest,
+                       sizeof(struct sockaddr_at)) < 0) {
+                LOG(log_error, logtype_atalkd, "nbp lkupreply sendto broadcast: %s",
+                    strerror(errno));
+                return 0;
+            }
+            
+            LOG(log_debug, logtype_atalkd,
+                "nbp_packet: forwarded NBPOP_LKUPREPLY to local network (broadcast)");
+        }
         break;
 
     default :

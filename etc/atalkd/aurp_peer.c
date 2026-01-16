@@ -12,9 +12,11 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <net/route.h>
 #include <netdb.h>
 #include <errno.h>
 #include <string.h>
@@ -1307,7 +1309,7 @@ int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
     rt->rt_lastnet = htons(lastnet);
     rt->rt_hops = hops + 1;  /* Add 1 for the AURP tunnel hop */
     rt->rt_state = RTMPTAB_GOOD;
-    rt->rt_flags = RTMPTAB_AURP;
+    rt->rt_flags = RTMPTAB_AURP | RTMPTAB_HASZONES | RTMPTAB_ROUTE;  /* Mark as active route for RTMP */
     if (firstnet != lastnet) {
         rt->rt_flags |= RTMPTAB_EXTENDED;
     }
@@ -1336,8 +1338,8 @@ int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
     }
 
     LOG(log_info, logtype_atalkd,
-        "aurp_rtmp_add_route: added %u-%u hops %u from %s to interface %s",
-        firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr), iface->i_name);
+        "aurp_rtmp_add_route: added AURP route %u-%u hops %u from %s (via IP tunnel)",
+        firstnet, lastnet, rt->rt_hops, inet_ntoa(peer->ap_addr));
 
     return 0;
 }

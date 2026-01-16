@@ -598,8 +598,13 @@ static void as_timer(int sig _U_)
                      * the -router switch to seed that interface, we need not
                      * worry about split horizon. Otherwise interface won't
                      * transmit RTMP broadcasts.
+                     * 
+                     * AURP routes should always be advertised on local interfaces
+                     * since they originate from IP tunnels, not AppleTalk interfaces.
                      */
-                    if (!(iface->i_flags & IFACE_RSEED) && (rtmp->rt_iface == iface)) {
+                    if (!(iface->i_flags & IFACE_RSEED) && 
+                        !(rtmp->rt_flags & RTMPTAB_AURP) &&
+                        (rtmp->rt_iface == iface)) {
                         continue;
                     }
 
