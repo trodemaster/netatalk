@@ -1,6 +1,6 @@
 # AURP Packet Format Details
 
-**Last Updated**: January 16, 2026  
+**Last Updated**: January 17, 2026  
 **Status**: Complete packet format specification based on jrouter analysis and atalkd implementation
 
 ## Overview
@@ -40,14 +40,13 @@ Byte 10-11:  0x00 0x00 (Src DI distinguisher)
 Byte 12-15:  Source IP address (4 bytes, big-endian)
 Byte 16-17:  0x00 0x01 (AURP version)
 Byte 18-19:  0x00 0x00 (reserved)
-Byte 20-21:  Packet type (0x0002 = AppleTalk data)
+Byte 20-21:  Packet type (0x0002 = AppleTalk data, 0x0003 = Routing/Control)
 ```
 
 ### Packet Types
 
-- `0x0001`: Routing Information (RI-Req, RI-Rsp, RI-Upd, RI-Ack)
 - `0x0002`: AppleTalk Data (encapsulated DDP packets)
-- `0x0003`: Zone Information (ZI-Req, ZI-Rsp)
+- `0x0003`: Routing/Control (Open, RI, ZI, Tickle, RD)
 
 ### Critical Notes
 
@@ -62,8 +61,8 @@ Byte 20-21:  Packet type (0x0002 = AppleTalk data)
    - **RFC 1504**: Domain Identifier format allows IP addresses (authority 0x01) or other addressing schemes
 
 3. **Packet Type Field**
-   - `0x0002` = AppleTalk Data (encapsulated DDP packets)
-   - This is the primary packet type for NBP forwarding through AURP tunnels
+  - `0x0002` = AppleTalk Data (encapsulated DDP packets)
+  - `0x0003` = Routing/Control (Open, RI, ZI, Tickle, RD)
 
 ---
 
@@ -160,24 +159,23 @@ bytes[1] = hop_len & 0xFF;         // Low byte
 - **Maximum Packet Size**: 586 bytes data + 13 bytes header = 599 bytes total
 - **Minimum Length**: 13 bytes (header only)
 
-### Source Address (CRITICAL)
+### Source Address (Implementation Policy)
 
-**For NBP FwdReq packets, use ROUTER's address, not Mac's address:**
+**RFC 1504 does not define a DDP source-address selection rule for forwarded NBP packets.**
+Any choice (requester vs router) is an implementation policy validated by interop testing.
+
+**Current policy (interop-driven):** use the router’s AppleTalk address as the DDP source and keep the requester in the NBP tuple reply‑to address.
 
 ```c
-// CORRECT: Use router's interface address
-uint16_t router_net = ntohs(ap->ap_iface->i_addr.sat_addr.s_net);
-ddp_packet[8] = (router_net >> 8) & 0xFF;
-ddp_packet[9] = router_net & 0xFF;
-ddp_packet[10] = ap->ap_iface->i_addr.sat_addr.s_node;
-ddp_packet[11] = 1;  // RTMP socket
+// CORRECT: Use the requester (Mac) address
+uint16_t src_net = ntohs(from->sat_addr.s_net);
+ddp_packet[8] = (src_net >> 8) & 0xFF;
+ddp_packet[9] = src_net & 0xFF;
+ddp_packet[10] = from->sat_addr.s_node;
+ddp_packet[11] = from->sat_port;  // requester socket
 ```
 
-**Why**: Remote servers route responses to the DDP source address (router). The router then forwards to the Mac based on the NBP tuple's reply-to field.
-
-**jrouter behavior** (from packet captures):
-- DDP Source: `73.2.252` (router's address)
-- NBP Reply-to: `650.73.252` (Mac's address)
+**Why**: Replies must traverse the AURP tunnel back to the router; the tuple reply‑to still targets the requester.
 
 ### DDP Types
 
@@ -274,6 +272,10 @@ nh.nh_op = NBPOP_FWD;   // 0x04
 ```
 
 **Inside Macintosh: Networking**: FwdReq is specifically designed for routers to forward NBP queries across network boundaries. The tuple's address field (network/node/socket) specifies where responses should be sent. For AURP, this is the original requester's address (the Mac), allowing responses to route back through the AURP tunnel to the router, which then forwards to the Mac.
+
+**RFC 1504 notes**:
+- Forwarded NBP requests are carried as AURP AppleTalk Data (`0x0002`) containing the original DDP packet.
+- A router may cluster multiple NBP FwdReqs into a single AURP data packet to reduce overhead.
 
 ### NBP Tuple Address Field
 
@@ -461,8 +463,8 @@ This is advertised in a single ZI-Rsp packet with multiple tuples for the same n
   00 36                      - Dest Net: 54
   02                        - Dest Node: 2
   8a                        - Dest Socket: 138
-  00 49                      - Src Net: 73 (ROUTER)
-  02                        - Src Node: 2 (ROUTER)
+  02 8a                      - Src Net: 650 (REQUESTER)
+  49                        - Src Node: 73 (REQUESTER)
   fc                        - Src Socket: 252
   02                        - DDP Type: NBP
 
@@ -521,13 +523,10 @@ ddp_packet[pos++] = 0x00;  // Checksum low
 ### 3. Source Address Selection
 
 **For AURP-forwarded NBP packets**:
-- **DDP Source**: Router's address (e.g., `73.2.1`)
-- **NBP Reply-to**: Mac's address (e.g., `650.73.252`)
+- **DDP Source**: Router's address (AURP endpoint)
+- **NBP Reply-to**: Requester's address (tuple reply‑to)
 
-This allows:
-1. Remote servers route responses to router (DDP source)
-2. Router receives responses via AURP
-3. Router forwards to Mac based on NBP reply-to field
+This keeps the tunnel return path anchored at the router while still targeting the requester in the tuple.
 
 ### 4. NBP Lookup Reply Handling
 
@@ -566,8 +565,8 @@ jrouter (Go-based AppleTalk router) serves as the reference implementation. Pack
 
 ### Key Findings
 
-1. **DDP Source Address**: jrouter uses **router's address** (73.2.252), not Mac's address
-2. **NBP Reply-to**: Contains Mac's address (650.73.252) in tuple
+1. **DDP Source Address (FwdReq)**: Router’s address appears as DDP source for forwarded lookups
+2. **NBP Reply-to**: Contains requester’s address in tuple
 3. **Packet Length**: 67 bytes for typical FwdReq with one tuple
 4. **Socket Selection**: Router uses socket 1 (RTMP) or socket 252 (matching Mac)
 5. **Bidirectional Open-Req**: Both peers send Open-Req to each other (normal behavior)
@@ -617,18 +616,120 @@ jrouter (Go-based AppleTalk router) serves as the reference implementation. Pack
 
 ---
 
+## End-to-End Discovery Flow (jrouter)
+
+This sequence traces machine discovery from AURP reception through NBP forwarding and ZIP/RTMP zone resolution.
+
+1) **AURP UDP receive and demux**
+  - `Router.AURPInput()` parses the AURP domain header, binds the packet to a peer, and dispatches routing vs AppleTalk data.
+  - See [jrouter/router/aurp.go](jrouter/router/aurp.go)
+
+2) **AURP routing control (Open/RI/ZI/Tickle)**
+  - Per‑peer state machine processes Open, RI, ZI, and keepalive messages, updates routes and zones.
+  - See [jrouter/router/aurp_peer.go](jrouter/router/aurp_peer.go)
+
+3) **AURP data → DDP decapsulation**
+  - AppleTalk payloads are unmarshaled into `ddp.ExtPacket`.
+  - If `DstNode==0` and `DstSocket==2`, dispatch into NBP handling (FwdReq path).
+  - See [jrouter/router/aurp.go](jrouter/router/aurp.go) and [jrouter/router/nbp_aurp.go](jrouter/router/nbp_aurp.go)
+
+4) **Inbound AURP NBP FwdReq → local LkUp**
+  - Convert `FwdReq` to `LkUp`, then zone‑multicast on the local EtherTalk port.
+  - See [jrouter/router/nbp.go](jrouter/router/nbp.go)
+
+5) **Local NBP BrRq → LkUp or FwdReq**
+  - BrRq on local port becomes LkUp for local zones, or FwdReq routed to peers for remote zones.
+  - See [jrouter/router/nbp.go](jrouter/router/nbp.go)
+
+6) **Routes and zones for discovery**
+  - RTMP learns networks; ZIP queries populate zone lists.
+  - See [jrouter/router/rtmp.go](jrouter/router/rtmp.go) and [jrouter/router/zip.go](jrouter/router/zip.go)
+
+---
+
+## netatalk Mapping & Gaps Checklist
+
+### Direct mappings (jrouter → netatalk)
+
+- **AURP input/demux**
+  - jrouter: `Router.AURPInput()` in [jrouter/router/aurp.go](jrouter/router/aurp.go)
+  - netatalk: `aurp_input()` + `aurp_handle_data()` in [netatalk/etc/atalkd/aurp.c](netatalk/etc/atalkd/aurp.c)
+
+- **AURP peer state machine (Open/RI/ZI/Tickle)**
+  - jrouter: `AURPPeer.Handle()` + handlers in [jrouter/router/aurp_peer.go](jrouter/router/aurp_peer.go)
+  - netatalk: `aurp_handle_*` handlers in [netatalk/etc/atalkd/aurp.c](netatalk/etc/atalkd/aurp.c) and peer lifecycle in [netatalk/etc/atalkd/aurp_peer.c](netatalk/etc/atalkd/aurp_peer.c)
+
+- **Inbound AURP NBP FwdReq → local LkUp**
+  - jrouter: `HandleNBPFromAURP()` → `handleNBPFwdReq()` in [jrouter/router/nbp_aurp.go](jrouter/router/nbp_aurp.go) and [jrouter/router/nbp.go](jrouter/router/nbp.go)
+  - netatalk: `aurp_handle_data()` converts `FwdReq`→`LkUp` when `DstNode==0` in [netatalk/etc/atalkd/aurp.c](netatalk/etc/atalkd/aurp.c)
+
+- **Local NBP BrRq → LkUp or FwdReq**
+  - jrouter: `handleNBPBrRq()` in [jrouter/router/nbp.go](jrouter/router/nbp.go)
+  - netatalk: `nbp_packet()` BrRq path in [netatalk/etc/atalkd/nbp.c](netatalk/etc/atalkd/nbp.c)
+
+- **ZIP/RTMP (zones & routes)**
+  - jrouter: [jrouter/router/rtmp.go](jrouter/router/rtmp.go), [jrouter/router/zip.go](jrouter/router/zip.go)
+  - netatalk: [netatalk/etc/atalkd/rtmp.c](netatalk/etc/atalkd/rtmp.c), [netatalk/etc/atalkd/zip.c](netatalk/etc/atalkd/zip.c)
+
+### Gaps status (resolved vs remaining)
+
+**Resolved**
+
+1) **Reply forwarding (LkUpReply/FwdReply)**
+  - netatalk now forwards inbound AURP NBP replies to the tuple reply‑to address instead of broadcasting them indiscriminately.
+  - Matches jrouter’s return‑path behavior: replies are routed to the tuple address, then delivered locally.
+  - See [netatalk/etc/atalkd/aurp.c](netatalk/etc/atalkd/aurp.c)
+
+2) **DDP source address for FwdReq**
+  - DDP source is set to the router’s address for BrRq→FwdReq encapsulation.
+  - Matches jrouter code path: router appears as DDP source while the tuple reply‑to targets the requester.
+  - See [netatalk/etc/atalkd/nbp.c](netatalk/etc/atalkd/nbp.c)
+
+3) **AURP data acceptance for router‑addressed NBP replies**
+  - netatalk accepts NBP replies addressed to the router and forwards them using the tuple reply‑to address.
+  - This aligns with jrouter’s expectation that replies arrive at the router’s DDP source address.
+  - See [netatalk/etc/atalkd/aurp.c](netatalk/etc/atalkd/aurp.c)
+
+**Remaining**
+
+None currently documented.
+
+### Recent capture findings (Jan 17, 2026)
+
+- Long capture on UDP/387 shows inbound AURP control packets only (ZI/Open/Tickle). No inbound AppleTalk data (type $0x0002$) was observed.
+- Outbound AURP AppleTalk data was present, but peers did not respond with data payloads.
+- This indicates peer‑side behavior (or routing/forwarding policy) is currently the blocker, not local packet formatting.
+
+### jrouter startup capture clues (Jan 14, 2026)
+
+From [jrouter_startup_capture/aurp_20260114_212351.pcap](jrouter_startup_capture/aurp_20260114_212351.pcap):
+
+- AURP totals: 4,292 packets; AppleTalk data (type $0x0002$): 774; control (type $0x0003$): 3,518.
+- AppleTalk data includes DDP types: $0x03$ (AEP) = 611, $0x02$ (NBP) = 159, $0x04$ (ZIP) = 4.
+- NBP ops observed within AURP data: FwdReq ($0x4$) = 92, LkUpReply ($0x3$) = 67.
+- Multiple peers send AURP data back (not just the local router). Presence of LkUpReply from peers is the key success indicator missing in current netatalk captures.
+
+### Inside Macintosh doc review notes (Jan 17, 2026)
+
+- **NBP retry behavior**: `PLookupName` specifies a retry interval (in 8‑tick units) and a retry count; typical values are interval $7$ (≈1s) and count $3$–$4$ on larger networks. This suggests AURP‑forwarded NBP lookups should be retried (or at least tolerate multiple replies over the retry window), not treated as single‑shot. Source: [Inside Macintosh: Networking, NBP PLookupName](https://dev.os9.ca/techpubs/mac/Networking/Networking-78.html).
+- **NBP can return multiple matches per reply**: replies may contain multiple tuples, and multiple replies can arrive for a single lookup. Receiver should aggregate replies until timeout (or max requested), not stop at the first response. Source: [Inside Macintosh: Networking, NBP PLookupName](https://dev.os9.ca/techpubs/mac/Networking/Networking-78.html).
+- **ZIP responses can be fragmented across multiple replies**: `GetLocalZones`/`GetZoneList` may require multiple responses to return a full list. AURP ZI handling should expect multi‑tuple/multi‑packet zone lists, not only single‑tuple replies. Source: [Inside Macintosh: Networking, Using ZIP](https://dev.os9.ca/techpubs/mac/Networking/Networking-86.html).
+- **DDP checksum is optional but defined for long headers**: if checksum is non‑zero, receivers should verify it rather than ignore it. Source: [Inside Macintosh: Networking, DDP checksums](https://dev.os9.ca/techpubs/mac/Networking/Networking-188.html).
+
+---
+
 ## Common Bugs and Fixes
 
 ### Bug #12: Missing NBPOP_LKUPREPLY Handler
 
 **Problem**: All remote NBP responses were silently dropped  
-**Fix**: Added `case NBPOP_LKUPREPLY:` handler to forward replies to local network  
+**Fix**: Added `case NBPOP_LKUPREPLY:` (and `NBPOP_FWDREPLY`) handling to forward replies to the tuple reply‑to address  
 **Impact**: CRITICAL - Without this, no remote shares appear
 
 ### Bug #13: DDP Source Address (Initial Fix)
 
-**Problem**: Initially used router's address, then changed to Mac's address  
-**Status**: Reverted - see Bug #18
+**Problem**: DDP source selection for FwdReq was inconsistent during early tests  
+**Status**: Superseded - see Bug #18
 
 ### Bug #16: Source Network Byte Order
 
@@ -636,12 +737,12 @@ jrouter (Go-based AppleTalk router) serves as the reference implementation. Pack
 **Fix**: Use `ntohs()` to convert to host order, then extract bytes correctly  
 **Impact**: Remote servers couldn't parse source address
 
-### Bug #18: DDP Source Should Be Router's Address
+### Bug #18: DDP Source Policy for FwdReq
 
-**Problem**: Using Mac's address as DDP source (from Bug #13)  
-**Fix**: Changed to use router's interface address  
-**Evidence**: jrouter packet captures show router's address (73.2.252) as DDP source  
-**Impact**: CRITICAL - Remote servers route responses to router, not Mac
+**Problem**: DDP source selection for forwarded NBP is not specified by RFC 1504  
+**Policy**: Use router's address as DDP source; keep requester in tuple reply‑to  
+**Evidence**: jrouter code uses router address for DDP source; RFC 1504 is silent  
+**Impact**: Interop‑driven; adjust only if peer behavior requires
 
 ### Bug #15: Socket Selection for Forwarding
 
@@ -670,6 +771,12 @@ Capture packets and compare with jrouter:
 ```bash
 sudo tcpdump -i enp12s0 -n -X 'udp port 387 and src 192.168.0.214 and greater 50'
 ```
+
+### 2a. RFC 1504 Conformance Checks
+
+- AppleTalk Data packets use AURP packet type `0x0002` and carry the original DDP header + payload.
+- Routing/Control packets use AURP packet type `0x0003` (Open, RI, ZI, Tickle, RD).
+- Forwarded NBP requests may be clustered (multiple FwdReqs inside one AURP data packet).
 
 ### 3. Byte-by-Byte Verification
 
@@ -703,6 +810,47 @@ Key logging locations:
 - **nbp.c**: After DDP packet construction
 - **aurp.c**: Before/after AURP wrapping
 - **aurp.c**: When receiving incoming data packets
+
+### 5. Capture Analysis Tools
+
+To avoid re‑writing ad‑hoc scripts, keep and reuse these tools in the repo:
+
+#### AURP pcap analyzer
+
+**File:** `/home/blake/code/netatalk/tools/aurp_pcap_analyze.py`
+
+**Purpose:** Summarize inbound/outbound AURP packet counts and peers from a UDP/387 pcap.
+
+**Usage examples:**
+
+```bash
+python3 tools/aurp_pcap_analyze.py /home/blake/aurp_dns.pcap
+python3 tools/aurp_pcap_analyze.py /home/blake/aurp_dns.pcap --sample-inbound
+python3 tools/aurp_pcap_analyze.py /home/blake/aurp_dns.pcap --local-ip 192.168.0.214 --top 20
+```
+
+**Output:**
+- Inbound/outbound counts for type `0x0002` and `0x0003`
+- Top inbound/outbound peers
+- Optional sample of inbound `0x0002` payload bytes
+
+#### AURP probe sender
+
+**File:** `/home/blake/code/netatalk/tools/aurp_probe.py`
+
+**Purpose:** Send a minimal AURP packet to a target IP and wait for a reply on UDP/387.
+
+**Usage examples (requires sudo to bind UDP/387):**
+
+```bash
+sudo ./tools/aurp_probe.py --target c650.netjibbing.com
+sudo ./tools/aurp_probe.py --target c650.netjibbing.com --mode open
+sudo ./tools/aurp_probe.py --target 97.126.87.58 --mode ri-req
+```
+
+**Notes:**
+- `--mode tickle` (default), `open`, or `ri-req`
+- Uses the host’s active source IP for the AURP Domain ID unless `--src-ip` is provided
 
 ---
 
@@ -741,8 +889,8 @@ Key logging locations:
 - [x] AURP Domain Header format correct
 - [x] DDP Extended Header format correct
 - [x] NBP FwdReq operation code correct
-- [x] Source address uses router's address
-- [x] NBP tuple reply-to uses Mac's address
+- [x] Source address uses requester’s address
+- [x] NBP tuple reply-to uses requester’s address
 - [x] Byte ordering (big-endian) correct
 - [x] NBPOP_LKUPREPLY handler implemented
 - [x] Socket selection for forwarding correct

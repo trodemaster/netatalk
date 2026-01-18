@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
+#include <arpa/inet.h>
 #include <atalk/logger.h>
 #include <sys/types.h>
 #include <sys/param.h>
@@ -27,6 +29,15 @@
 #include <sys/sockio.h>
 #endif /* __svr4__ */
 
+#ifdef __linux__
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
+#include <linux/if.h>
+#ifndef ETH_P_AT
+#define ETH_P_AT 0x809B
+#endif
+#endif
+
 #include "atserv.h"
 #include "interface.h"
 #include "list.h"
@@ -37,9 +48,133 @@
 #include "multicast.h"
 #include "aurp.h"
 
+/*
+ * DDP checksum computation (long header).
+ * Algorithm: checksum := checksum + next byte; rotate MSB to LSB; repeat.
+ * Computation covers bytes after checksum field through end of DDP packet.
+ */
+static uint16_t nbp_ddp_checksum(const unsigned char *ddp, int ddp_len)
+{
+    uint16_t sum = 0;
+    int i;
+
+    for (i = 4; i < ddp_len; i++) {
+        sum = (uint16_t)(sum + ddp[i]);
+        sum = (uint16_t)((sum << 1) | (sum >> 15));
+    }
+
+    if (sum == 0) {
+        sum = 0xffff;
+    }
+
+    return sum;
+}
+
+#ifdef __linux__
+static int nbp_send_zone_multicast(struct interface *iface,
+                                   const unsigned char *dst_hw,
+                                   const unsigned char *nbp_payload,
+                                   int nbp_len)
+{
+    unsigned char frame[1800];
+    unsigned char ddp_packet[1600];
+    unsigned char src_hw[6];
+    struct ifreq ifr;
+    struct sockaddr_ll sll;
+    uint16_t llc_len;
+    uint16_t src_net_host;
+    uint16_t hop_len;
+    int ddp_len;
+    int frame_len;
+    int fd;
+    int pos;
+
+    if (nbp_len <= 0 || nbp_len > 1400) {
+        return -1;
+    }
+
+    ddp_len = 13 + nbp_len;
+    if (ddp_len > (int)sizeof(ddp_packet)) {
+        return -1;
+    }
+
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_802_2));
+    if (fd < 0) {
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface->i_name, sizeof(ifr.ifr_name) - 1);
+
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    memcpy(src_hw, ifr.ifr_hwaddr.sa_data, sizeof(src_hw));
+
+    src_net_host = ntohs(iface->i_addr.sat_addr.s_net);
+
+    pos = 0;
+    hop_len = (0 << 10) | (ddp_len & 0x3FF);
+    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;
+    ddp_packet[pos++] = hop_len & 0xFF;
+    ddp_packet[pos++] = 0x00;
+    ddp_packet[pos++] = 0x00;
+    ddp_packet[pos++] = 0x00;
+    ddp_packet[pos++] = 0x00;
+    ddp_packet[pos++] = ATADDR_BCAST;
+    ddp_packet[pos++] = 2;
+    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;
+    ddp_packet[pos++] = src_net_host & 0xFF;
+    ddp_packet[pos++] = iface->i_addr.sat_addr.s_node;
+    ddp_packet[pos++] = 2;
+    ddp_packet[pos++] = DDPTYPE_NBP;
+
+    memcpy(ddp_packet + pos, nbp_payload, nbp_len);
+
+    memcpy(frame, dst_hw, 6);
+    memcpy(frame + 6, src_hw, 6);
+    llc_len = htons((uint16_t)(8 + ddp_len));
+    memcpy(frame + 12, &llc_len, sizeof(llc_len));
+    frame[14] = 0xAA;
+    frame[15] = 0xAA;
+    frame[16] = 0x03;
+    frame[17] = 0x00;
+    frame[18] = 0x00;
+    frame[19] = 0x00;
+    frame[20] = (ETH_P_AT >> 8) & 0xFF;
+    frame[21] = ETH_P_AT & 0xFF;
+    memcpy(frame + 22, ddp_packet, ddp_len);
+
+    frame_len = 22 + ddp_len;
+
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_802_2);
+    sll.sll_ifindex = ifr.ifr_ifindex;
+    sll.sll_halen = 6;
+    memcpy(sll.sll_addr, dst_hw, 6);
+
+    if (sendto(fd, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    return 0;
+}
+#endif
+
 extern int  transition;
 
 struct nbptab   *nbptab = NULL;
+
 
 static
 void nbp_ack(int fd, int nh_op, int nh_id, struct sockaddr_at *to)
@@ -97,10 +232,21 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
     nbpop = data;           /* remember for fwd and brrq */
     data += SZ_NBPHDR;
 
-    if (nh.nh_cnt != 1) {
+    if (nh.nh_cnt < 1) {
         LOG(log_info, logtype_atalkd, "nbp_packet: bad tuple count (%d/%d)", nh.nh_cnt,
             nh.nh_op);
         return 1;
+    }
+
+    /* Requests should carry exactly one tuple. Replies may contain multiple tuples. */
+    if (nh.nh_op == NBPOP_BRRQ || nh.nh_op == NBPOP_LKUP ||
+        nh.nh_op == NBPOP_FWD || nh.nh_op == NBPOP_RGSTR ||
+        nh.nh_op == NBPOP_UNRGSTR) {
+        if (nh.nh_cnt != 1) {
+            LOG(log_info, logtype_atalkd, "nbp_packet: bad tuple count (%d/%d)", nh.nh_cnt,
+                nh.nh_op);
+            return 1;
+        }
     }
 
     memcpy(&nt, data, SZ_NBPTUPLE);
@@ -530,21 +676,17 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     uint8_t tuple_node = tuple_start[2];
                     uint8_t tuple_socket = tuple_start[3];
                     
-                    /* CRITICAL: Use ORIGINAL Mac requester's address as DDP source
-                     * Per jrouter analysis: "MUST be the original Mac requester's address, NOT the router's address"
-                     * Remote servers will route responses back through AURP to reach the original requester
-                     * Note: from->sat_addr.s_net is already in network byte order, so use it directly */
-                    uint16_t src_net_be = ntohs(from->sat_addr.s_net);  /* Convert to host for logging, but we'll use network order */
-                    /* Actually, we need network byte order for the packet, so use from->sat_addr.s_net directly */
-                    /* Or convert host-order src_net back to network order with htons() */
+                    /* Use the original requester as the DDP source, matching jrouter. */
                     LOG(log_error, logtype_atalkd,
                         "DEBUG NBP TUPLE: from %u.%u.%u, tuple says respond to %u.%u.%u",
                         src_net, from->sat_addr.s_node, from->sat_port,
                         tuple_net, tuple_node, tuple_socket);
-                    uint16_t router_net_host = ntohs(ap->ap_iface->i_addr.sat_addr.s_net);
+                    uint16_t src_net_host = src_net;
+                    uint8_t src_node = from->sat_addr.s_node;
+                    uint8_t src_socket = from->sat_port;
                     LOG(log_error, logtype_atalkd,
-                        "DEBUG DDP SOURCE: Using ROUTER address %u.%u.1 (per jrouter packet analysis)",
-                        router_net_host, ap->ap_iface->i_addr.sat_addr.s_node);
+                        "DEBUG DDP SOURCE: Using REQUESTER address %u.%u.%u",
+                        src_net_host, src_node, src_socket);
                     
                     /* DEBUG: Show the full NBP data bytes before sending */
                     char hex_buf[256];
@@ -594,19 +736,15 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     /* Byte 7: Destination Socket */
                     ddp_packet[pos++] = sat.sat_port;
 
-                    /* Bytes 8-9: Source Network (big-endian) - ROUTER'S ADDRESS!
-                     * Per jrouter packet analysis: DDP source uses ROUTER's address (73.2.252),
-                     * while NBP tuple reply-to uses Mac's address (650.73.252).
-                     * Responses come to router, which forwards to Mac based on NBP tuple.
-                     * Use router's interface address (already computed above). */
-                    ddp_packet[pos++] = (router_net_host >> 8) & 0xFF;  /* High byte */
-                    ddp_packet[pos++] = router_net_host & 0xFF;        /* Low byte */
+                    /* Bytes 8-9: Source Network (big-endian) - router interface */
+                    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;
+                    ddp_packet[pos++] = src_net_host & 0xFF;
 
-                    /* Byte 10: Source Node - ROUTER'S ADDRESS! */
-                    ddp_packet[pos++] = ap->ap_iface->i_addr.sat_addr.s_node;
+                    /* Byte 10: Source Node - router interface */
+                    ddp_packet[pos++] = src_node;
 
-                    /* Byte 11: Source Socket - Use RTMP socket (1) for router */
-                    ddp_packet[pos++] = 1;  /* RTMP socket */
+                    /* Byte 11: Source Socket - NBP socket */
+                    ddp_packet[pos++] = src_socket;
 
                     /* Byte 12: DDP Type (NBP = 0x02) */
                     ddp_packet[pos++] = DDPTYPE_NBP;
@@ -616,6 +754,13 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                      * 'end' points to end of received packet
                      * This includes: NBP header (2 bytes) + NBP tuples */
                     memcpy(ddp_packet + pos, nbpop, nbp_data_len);
+
+                    /* Compute DDP checksum over header+payload (long header). */
+                    {
+                        uint16_t cksum = nbp_ddp_checksum(ddp_packet, total_len);
+                        ddp_packet[2] = (cksum >> 8) & 0xFF;
+                        ddp_packet[3] = cksum & 0xFF;
+                    }
 
                     /* DEBUG: Verify DDP packet construction */
                     LOG(log_error, logtype_atalkd,
@@ -633,7 +778,21 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     continue;
                 }
 
-                /* Local route - use regular AppleTalk sendto() */
+                /* Local route - prefer zone multicast when available */
+#ifdef __linux__
+                if (zt != NULL && zt->zt_bcast != NULL &&
+                    sat.sat_addr.s_net == 0 && sat.sat_addr.s_node == ATADDR_BCAST) {
+                    unsigned char *nbp_payload = (unsigned char *)(data - len) + 1;
+                    int nbp_len = len - 1;
+
+                    if (nbp_len > 0 &&
+                        nbp_send_zone_multicast(ap->ap_iface, zt->zt_bcast,
+                                                nbp_payload, nbp_len) == 0) {
+                        continue;
+                    }
+                }
+#endif
+
                 if (sendto(ap->ap_fd, data - len, len, 0,
                            (struct sockaddr *)&sat,
                            sizeof(struct sockaddr_at)) < 0) {
@@ -817,49 +976,20 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
         break;
 
     case NBPOP_LKUPREPLY :
+    case NBPOP_FWDREPLY :
         /*
-         * This is a Lookup Reply, typically from a remote AFP server responding
-         * to our NBP FwdReq. The reply is addressed to us (the router) because
-         * we used our address as the DDP source in the FwdReq.
+         * This is a Lookup Reply or Forward Reply, typically from a remote AFP
+         * server responding to our NBP FwdReq. The reply is addressed to us
+         * (the router) because we used our address as the DDP source in the FwdReq.
          * 
          * We need to forward this reply to the original requester (the Mac).
          * The original requester's address is in the NBP tuple's reply-to field.
          */
-        LOG(log_error, logtype_atalkd,
-            "*** NBPOP_LKUPREPLY RECEIVED! from %u.%u.%u, ID=%u, count=%u, len=%d ***",
+        LOG(log_debug, logtype_atalkd,
+            "nbp_packet: NBP reply received (op=%u) from %u.%u.%u id=%u count=%u len=%d",
+            nh.nh_op,
             ntohs(from->sat_addr.s_net), from->sat_addr.s_node, from->sat_port,
             nh.nh_id, nh.nh_cnt, len);
-        
-        /* Simply forward the packet to the address it came from
-         * (which should be the local Mac that sent the original BrRq).
-         * The NBP tuple contains the correct reply-to address.
-         * 
-         * For now, just re-broadcast it on the local network so the Mac can pick it up.
-         * The NBP protocol on the Mac side will match the ID and process it.
-         */
-        if (ap->ap_iface->i_flags & IFACE_ISROUTER) {
-            struct sockaddr_at reply_dest;
-            
-#ifdef BSD4_4
-            reply_dest.sat_len = sizeof(struct sockaddr_at);
-#endif
-            reply_dest.sat_family = AF_APPLETALK;
-            reply_dest.sat_addr.s_net = 0;  /* Network 0 = broadcast on this network */
-            reply_dest.sat_addr.s_node = ATADDR_BCAST;  /* Broadcast to all nodes */
-            reply_dest.sat_port = ap->ap_port;
-            
-            /* Forward the Lookup Reply as-is to the local network */
-            if (sendto(ap->ap_fd, data - len, len, 0,
-                       (struct sockaddr *)&reply_dest,
-                       sizeof(struct sockaddr_at)) < 0) {
-                LOG(log_error, logtype_atalkd, "nbp lkupreply sendto broadcast: %s",
-                    strerror(errno));
-                return 0;
-            }
-            
-            LOG(log_debug, logtype_atalkd,
-                "nbp_packet: forwarded NBPOP_LKUPREPLY to local network (broadcast)");
-        }
         break;
 
     default :

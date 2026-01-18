@@ -21,8 +21,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <atalk/logger.h>
 #include <atalk/ddp.h>
+#include <atalk/nbp.h>
+#include <atalk/util.h>
 #include <netatalk/at.h>
 #include <netatalk/ddp.h>
 
@@ -32,6 +35,17 @@
 #include "atserv.h"
 #include "zip.h"
 #include "list.h"
+#include "multicast.h"
+#include "nbp.h"
+
+#ifdef __linux__
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
+#include <linux/if.h>
+#ifndef ETH_P_AT
+#define ETH_P_AT 0x809B
+#endif
+#endif
 
 /* Global AURP configuration */
 struct aurp_config aurp_config = {
@@ -73,6 +87,24 @@ static void aurp_hexdump(const char *prefix, const char *data, int len)
         snprintf(line + offset, sizeof(line) - offset, "|");
         LOG(log_debug9, logtype_atalkd, "%s", line);
     }
+}
+
+/*
+ * DDP checksum verification (long header).
+ * Algorithm: checksum := checksum + next byte; rotate MSB to LSB; repeat.
+ * Computation covers bytes after checksum field through end of DDP packet.
+ */
+static uint16_t aurp_ddp_checksum(const unsigned char *ddp, int ddp_len)
+{
+    uint16_t sum = 0;
+    int i;
+
+    for (i = 4; i < ddp_len; i++) {
+        sum = (uint16_t)(sum + ddp[i]);
+        sum = (uint16_t)((sum << 1) | (sum >> 15));
+    }
+
+    return sum;
 }
 
 /*
@@ -615,6 +647,29 @@ void aurp_input(int fd)
         LOG(log_error, logtype_atalkd,
             "*** AURP DATA PACKET RECEIVED! from %s len=%d ***",
             inet_ntoa(peer_addr), remaining);
+
+        /* Log DDP header details if present */
+        if (remaining >= 13) {
+            unsigned char *dp = (unsigned char *)p;
+            uint16_t hop_len = (dp[0] << 8) | dp[1];
+            uint16_t ddp_len = hop_len & 0x03FF;
+            uint16_t dnet = (dp[4] << 8) | dp[5];
+            uint16_t snet = (dp[8] << 8) | dp[9];
+            LOG(log_error, logtype_atalkd,
+                "aurp_input: DDP %u.%u.%u -> %u.%u.%u proto=%u ddp_len=%u raw_len=%d",
+                snet, dp[10], dp[11],
+                dnet, dp[6], dp[7], dp[12], ddp_len, remaining);
+
+            if (ddp_len > remaining) {
+                LOG(log_warning, logtype_atalkd,
+                    "aurp_input: DDP length %u exceeds payload %d", ddp_len, remaining);
+            }
+        } else {
+            LOG(log_warning, logtype_atalkd,
+                "aurp_input: AppleTalk payload too short (%d)", remaining);
+        }
+
+        aurp_hexdump("AURP-DDP", p, remaining > 64 ? 64 : remaining);
         aurp_handle_data(peer, p, remaining);
         return;
     } else if (pkt_type != AURP_PKT_ROUTING) {
@@ -1301,8 +1356,414 @@ send:
 }
 
 /*
+ * ZI-Rsp - Send zone information response for requested networks only
+ * Splits across multiple packets if needed and sets LAST on final packet.
+ */
+int aurp_send_zi_rsp_for_nets(struct aurp_peer *peer, const uint16_t *nets, int count)
+{
+    char buf[AURP_MAX_PKT_SIZE];
+    int len = 0;
+    uint16_t tmp, zone_count = 0;
+    char *zone_count_ptr = NULL;
+    int sent_any = 0;
+    int ret = 0;
+    int i;
+    struct interface *iface;
+    struct list *l;
+    struct ziptab *zt;
+    extern struct interface *interfaces;
+
+    if (peer == NULL || nets == NULL || count <= 0) {
+        return -1;
+    }
+
+    for (i = 0; i < count; i++) {
+        uint16_t network = nets[i];
+
+        /* Find interface that owns this network (local interface routes) */
+        for (iface = interfaces; iface != NULL; iface = iface->i_next) {
+            uint16_t firstnet, lastnet;
+
+            if ((iface->i_flags & IFACE_CONFIG) == 0 || iface->i_rt == NULL) {
+                continue;
+            }
+            if (iface->i_flags & IFACE_LOOPBACK) {
+                continue;
+            }
+
+            firstnet = ntohs(iface->i_rt->rt_firstnet);
+            lastnet = ntohs(iface->i_rt->rt_lastnet);
+
+            if (network < firstnet || network > lastnet) {
+                continue;
+            }
+
+            if (iface->i_rt->rt_zt == NULL) {
+                break;
+            }
+
+            for (l = iface->i_rt->rt_zt; l != NULL; l = l->l_next) {
+                zt = (struct ziptab *)l->l_data;
+
+                if (len == 0) {
+                    int n = aurp_build_routing_header(buf, sizeof(buf), peer,
+                                                     peer->ap_remote_conn_id,
+                                                     0, AURP_CMD_ZI_RSP, 0);
+                    if (n < 0) {
+                        return -1;
+                    }
+                    len = n;
+
+                    tmp = htons(AURP_SUBCODE_ZI_NONEXT);
+                    memcpy(buf + len, &tmp, 2);
+                    len += 2;
+
+                    zone_count_ptr = buf + len;
+                    len += 2;
+                    zone_count = 0;
+                }
+
+                /* Ensure space: network(2) + length(1) + name(n) */
+                if (len + 3 + zt->zt_len > (int)sizeof(buf)) {
+                    tmp = htons(zone_count);
+                    memcpy(zone_count_ptr, &tmp, 2);
+
+                    if (aurp_send_packet(peer, buf, len) < 0) {
+                        return -1;
+                    }
+                    sent_any = 1;
+                    len = 0;
+                    zone_count_ptr = NULL;
+                    zone_count = 0;
+                }
+
+                if (len == 0) {
+                    int n = aurp_build_routing_header(buf, sizeof(buf), peer,
+                                                     peer->ap_remote_conn_id,
+                                                     0, AURP_CMD_ZI_RSP, 0);
+                    if (n < 0) {
+                        return -1;
+                    }
+                    len = n;
+
+                    tmp = htons(AURP_SUBCODE_ZI_NONEXT);
+                    memcpy(buf + len, &tmp, 2);
+                    len += 2;
+
+                    zone_count_ptr = buf + len;
+                    len += 2;
+                    zone_count = 0;
+                }
+
+                tmp = htons(network);
+                memcpy(buf + len, &tmp, 2);
+                len += 2;
+
+                buf[len++] = zt->zt_len;
+                memcpy(buf + len, zt->zt_name, zt->zt_len);
+                len += zt->zt_len;
+
+                zone_count++;
+            }
+
+            break;
+        }
+    }
+
+    if (len == 0 && !sent_any) {
+        int n = aurp_build_routing_header(buf, sizeof(buf), peer,
+                                         peer->ap_remote_conn_id,
+                                         0, AURP_CMD_ZI_RSP, AURP_FLAG_LAST);
+        if (n < 0) {
+            return -1;
+        }
+        len = n;
+        tmp = htons(AURP_SUBCODE_ZI_NONEXT);
+        memcpy(buf + len, &tmp, 2);
+        len += 2;
+        tmp = htons(0);
+        memcpy(buf + len, &tmp, 2);
+        len += 2;
+
+        ret = aurp_send_packet(peer, buf, len);
+        goto done;
+    }
+
+    if (len == 0 && sent_any) {
+        int n = aurp_build_routing_header(buf, sizeof(buf), peer,
+                                         peer->ap_remote_conn_id,
+                                         0, AURP_CMD_ZI_RSP, AURP_FLAG_LAST);
+        if (n < 0) {
+            return -1;
+        }
+        len = n;
+        tmp = htons(AURP_SUBCODE_ZI_NONEXT);
+        memcpy(buf + len, &tmp, 2);
+        len += 2;
+        tmp = htons(0);
+        memcpy(buf + len, &tmp, 2);
+        len += 2;
+
+        ret = aurp_send_packet(peer, buf, len);
+        goto done;
+    }
+
+    if (len > 0) {
+        char header_buf[AURP_MAX_PKT_SIZE];
+        int header_len;
+
+        header_len = aurp_build_routing_header(header_buf, sizeof(header_buf), peer,
+                                               peer->ap_remote_conn_id,
+                                               0, AURP_CMD_ZI_RSP, AURP_FLAG_LAST);
+        if (header_len < 0) {
+            return -1;
+        }
+
+        memcpy(buf, header_buf, header_len);
+        tmp = htons(zone_count);
+        memcpy(zone_count_ptr, &tmp, 2);
+
+        if (aurp_send_packet(peer, buf, len) < 0) {
+            return -1;
+        }
+    }
+
+done:
+    if (ret < 0) {
+        return -1;
+    }
+
+    peer->ap_local_seq = aurp_next_seq(peer->ap_local_seq);
+
+    LOG(log_info, logtype_atalkd,
+        "aurp_send_zi_rsp_for_nets: sent zones for %d networks to %s",
+        count, inet_ntoa(peer->ap_addr));
+
+    return 0;
+}
+
+/*
  * Data Forwarding Functions
  */
+
+int aurp_raw_init(void)
+{
+#ifdef __linux__
+    int fd;
+    int one = 1;
+
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_802_2));
+    if (fd < 0) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_raw_init: socket(AF_PACKET) failed: %s", strerror(errno));
+        return -1;
+    }
+
+#ifdef PACKET_IGNORE_OUTGOING
+    if (setsockopt(fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &one, sizeof(one)) < 0) {
+        LOG(log_debug, logtype_atalkd,
+            "aurp_raw_init: PACKET_IGNORE_OUTGOING not set: %s", strerror(errno));
+    }
+#endif
+
+    return fd;
+#else
+    return -1;
+#endif
+}
+
+void aurp_raw_input(int fd)
+{
+#ifdef __linux__
+    unsigned char buf[2048];
+    struct sockaddr_ll sll;
+    socklen_t sll_len = sizeof(sll);
+    int len;
+
+    len = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&sll, &sll_len);
+    if (len <= 0) {
+        return;
+    }
+
+    if (len < 22) {
+        return;
+    }
+
+    /* 802.2 SNAP header check: AA AA 03 00 00 00 80 9B */
+    if (buf[14] != 0xAA || buf[15] != 0xAA || buf[16] != 0x03 ||
+        buf[17] != 0x00 || buf[18] != 0x00 || buf[19] != 0x00 ||
+        buf[20] != ((ETH_P_AT >> 8) & 0xFF) || buf[21] != (ETH_P_AT & 0xFF)) {
+        return;
+    }
+
+    /* DDP starts after 14-byte 802.3 header + 8-byte SNAP */
+    unsigned char *ddp = buf + 22;
+    int ddp_avail = len - 22;
+    if (ddp_avail < 13) {
+        return;
+    }
+
+    uint16_t hop_len = (ddp[0] << 8) | ddp[1];
+    uint16_t ddp_len = hop_len & 0x3FF;
+    if (ddp_len < 13 || ddp_len > ddp_avail) {
+        return;
+    }
+
+    uint16_t dst_net = (ddp[4] << 8) | ddp[5];
+    if (dst_net == 0) {
+        return;
+    }
+
+    /* Avoid duplicating NBP forwarding (handled in nbp.c). */
+    if (ddp[12] == DDPTYPE_NBP) {
+        return;
+    }
+
+    if (aurp_find_peer_for_net(dst_net) == NULL) {
+        return;
+    }
+
+    /* Increment hop count (4 bits) if possible. */
+    uint16_t hop = (hop_len >> 10) & 0x0F;
+    if (hop >= 15) {
+        return;
+    }
+    hop_len = (uint16_t)(((hop + 1) << 10) | (ddp_len & 0x3FF));
+
+    unsigned char ddp_copy[2048];
+    if (ddp_len > sizeof(ddp_copy)) {
+        return;
+    }
+    memcpy(ddp_copy, ddp, ddp_len);
+    ddp_copy[0] = (hop_len >> 8) & 0xFF;
+    ddp_copy[1] = hop_len & 0xFF;
+
+    if (aurp_send_data(dst_net, (char *)ddp_copy, ddp_len) < 0) {
+        LOG(log_debug, logtype_atalkd,
+            "aurp_raw_input: failed forwarding DDP to net %u", dst_net);
+    } else {
+        LOG(log_debug, logtype_atalkd,
+            "aurp_raw_input: forwarded DDP type %u to net %u", ddp_copy[12], dst_net);
+    }
+#else
+    (void)fd;
+#endif
+}
+
+#ifdef __linux__
+static int aurp_send_zone_multicast(struct interface *iface,
+                                    const unsigned char *dst_hw,
+                                    const unsigned char *ddp, int ddp_len)
+{
+    unsigned char frame[1600];
+    unsigned char src_hw[6];
+    struct ifreq ifr;
+    struct sockaddr_ll sll;
+    uint16_t llc_len;
+    unsigned char *p = frame;
+    int fd;
+    int frame_len;
+
+    if (ddp_len <= 0 || ddp_len > 1400) {
+        return -1;
+    }
+
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_802_2));
+    if (fd < 0) {
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface->i_name, sizeof(ifr.ifr_name) - 1);
+
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    memcpy(src_hw, ifr.ifr_hwaddr.sa_data, sizeof(src_hw));
+
+    memcpy(p, dst_hw, 6);
+    p += 6;
+    memcpy(p, src_hw, 6);
+    p += 6;
+
+    llc_len = htons((uint16_t)(8 + ddp_len));
+    memcpy(p, &llc_len, sizeof(llc_len));
+    p += sizeof(llc_len);
+
+    p[0] = 0xAA;
+    p[1] = 0xAA;
+    p[2] = 0x03;
+    p[3] = 0x00;
+    p[4] = 0x00;
+    p[5] = 0x00;
+    p[6] = (ETH_P_AT >> 8) & 0xFF;
+    p[7] = ETH_P_AT & 0xFF;
+    p += 8;
+
+    memcpy(p, ddp, ddp_len);
+
+    frame_len = 14 + 8 + ddp_len;
+
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_802_2);
+    sll.sll_ifindex = ifr.ifr_ifindex;
+    sll.sll_halen = 6;
+    memcpy(sll.sll_addr, dst_hw, 6);
+
+    if (sendto(fd, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    return 0;
+}
+#endif
+
+static int aurp_try_zone_multicast(struct interface *iface, struct ziptab *zt,
+                                   const unsigned char *ddp, int ddp_len,
+                                   uint8_t dst_socket)
+{
+#ifdef __linux__
+    unsigned char *ddp_copy;
+
+    if (zt == NULL || zt->zt_bcast == NULL || ddp_len < 13) {
+        return 0;
+    }
+
+    ddp_copy = (unsigned char *)malloc(ddp_len);
+    if (ddp_copy == NULL) {
+        return 0;
+    }
+
+    memcpy(ddp_copy, ddp, ddp_len);
+    ddp_copy[4] = 0x00;
+    ddp_copy[5] = 0x00;
+    ddp_copy[6] = ATADDR_BCAST;
+    ddp_copy[7] = dst_socket;
+
+    if (aurp_send_zone_multicast(iface, zt->zt_bcast, ddp_copy, ddp_len) == 0) {
+        free(ddp_copy);
+        return 1;
+    }
+
+    free(ddp_copy);
+#endif
+    (void)iface;
+    (void)zt;
+    (void)ddp;
+    (void)ddp_len;
+    (void)dst_socket;
+    return 0;
+}
 
 /*
  * Find the AURP peer that provides a route to the given network
@@ -1400,6 +1861,7 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
      */
     unsigned char *p = (unsigned char *)data;
     uint16_t hop_len = (p[0] << 8) | p[1];
+    uint16_t checksum = (p[2] << 8) | p[3];
     ddp_len = hop_len & 0x3FF;
     
     dst_net = (p[4] << 8) | p[5];
@@ -1416,10 +1878,75 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         return;
     }
 
-    LOG(log_debug, logtype_atalkd,
+    if (checksum != 0) {
+        uint16_t calc = aurp_ddp_checksum(p, ddp_len);
+        if (calc != checksum) {
+            LOG(log_warning, logtype_atalkd,
+                "aurp_handle_data: bad DDP checksum (got 0x%04x expected 0x%04x)",
+                checksum, calc);
+            return;
+        }
+    }
+
+    LOG(log_error, logtype_atalkd,
         "aurp_handle_data: DDP %u.%u.%u -> %u.%u.%u len=%d",
         src_net, src_node, p[11],  /* src_socket */
         dst_net, dst_node, dst_socket, ddp_len);
+
+    /* If NBP, log basic tuple details to confirm replies arriving */
+    if (p[12] == DDPTYPE_NBP) {
+        int nbp_len = ddp_len - 13;
+        if (nbp_len >= SZ_NBPHDR) {
+            struct nbphdr nh;
+            struct nbptuple nt;
+            unsigned char *nbp = p + 13;
+            memcpy(&nh, nbp, SZ_NBPHDR);
+
+            if (nbp_len >= SZ_NBPHDR + SZ_NBPTUPLE) {
+                memcpy(&nt, nbp + SZ_NBPHDR, SZ_NBPTUPLE);
+                LOG(log_error, logtype_atalkd,
+                    "aurp_handle_data: NBP op=%u cnt=%u id=%u tuple=%u.%u.%u",
+                    nh.nh_op, nh.nh_cnt, nh.nh_id,
+                    ntohs(nt.nt_net), nt.nt_node, nt.nt_port);
+
+                /* Best-effort parse of NBP strings (object/type/zone) */
+                unsigned char *q = nbp + SZ_NBPHDR + SZ_NBPTUPLE;
+                unsigned char *nbp_end = nbp + nbp_len;
+                if (q < nbp_end) {
+                    unsigned char objlen = *q++;
+                    unsigned char *obj = q;
+                    if (q + objlen <= nbp_end) {
+                        q += objlen;
+                        if (q < nbp_end) {
+                            unsigned char typelen = *q++;
+                            unsigned char *typ = q;
+                            if (q + typelen <= nbp_end) {
+                                q += typelen;
+                                if (q < nbp_end) {
+                                    unsigned char zonelen = *q++;
+                                    unsigned char *zone = q;
+                                    if (q + zonelen <= nbp_end) {
+                                        LOG(log_error, logtype_atalkd,
+                                            "aurp_handle_data: NBP names obj='%.*s' type='%.*s' zone='%.*s'",
+                                            objlen, (char *)obj,
+                                            typelen, (char *)typ,
+                                            zonelen, (char *)zone);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                LOG(log_error, logtype_atalkd,
+                    "aurp_handle_data: NBP op=%u cnt=%u id=%u (no tuple)",
+                    nh.nh_op, nh.nh_cnt, nh.nh_id);
+            }
+        } else {
+            LOG(log_error, logtype_atalkd,
+                "aurp_handle_data: NBP packet too short (%d bytes)", nbp_len);
+        }
+    }
     
     /* DEBUG: Show raw DDP header bytes and full packet hex */
     LOG(log_error, logtype_atalkd,
@@ -1437,13 +1964,29 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         (ddp_len < 40 ? ddp_len : 40), hex_buf);
 
     /*
-     * Find the local interface for this network
-     * Node 0 means "any router for this network" - that's us
+     * Find the local interface for this network.
+     * If dst_net is 0, it means "this network"; use the first configured
+     * non-loopback interface.
      */
     LOG(log_error, logtype_atalkd,
         "DEBUG IFACE: Looking for local interface for dest network %u", dst_net);
-    
-    for (iface = interfaces; iface != NULL; iface = iface->i_next) {
+
+    if (dst_net == 0) {
+        for (iface = interfaces; iface != NULL; iface = iface->i_next) {
+            if ((iface->i_flags & IFACE_CONFIG) == 0) {
+                continue;
+            }
+            if (iface->i_flags & IFACE_LOOPBACK) {
+                continue;
+            }
+            if (iface->i_rt == NULL) {
+                continue;
+            }
+            dest_iface = iface;
+            break;
+        }
+    } else {
+        for (iface = interfaces; iface != NULL; iface = iface->i_next) {
         LOG(log_error, logtype_atalkd,
             "DEBUG IFACE: Checking %s: flags=0x%x", iface->i_name, iface->i_flags);
         
@@ -1470,11 +2013,12 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
             "DEBUG IFACE: %s range %u-%u (checking if %u in range)", 
             iface->i_name, firstnet, lastnet, dst_net);
 
-        if (dst_net >= firstnet && dst_net <= lastnet) {
-            dest_iface = iface;
-            LOG(log_error, logtype_atalkd,
-                "DEBUG IFACE: MATCHED! Using %s", iface->i_name);
-            break;
+            if (dst_net >= firstnet && dst_net <= lastnet) {
+                dest_iface = iface;
+                LOG(log_error, logtype_atalkd,
+                    "DEBUG IFACE: MATCHED! Using %s", iface->i_name);
+                break;
+            }
         }
     }
 
@@ -1482,6 +2026,201 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         LOG(log_error, logtype_atalkd,
             "aurp_handle_data: no local interface for network %u", dst_net);
         return;
+    }
+
+    /*
+     * If this is an NBP reply, forward it to the reply-to address in the tuple.
+     * Remote peers often send replies to the router's DDP address; the tuple
+     * contains the original requester's address.
+     */
+    if ((uint8_t)data[12] == DDPTYPE_NBP && ddp_len >= 13 + SZ_NBPHDR + SZ_NBPTUPLE) {
+        struct nbphdr nh;
+        struct nbptuple nt;
+        unsigned char *nbp = (unsigned char *)data + 13;
+
+        memcpy(&nh, nbp, SZ_NBPHDR);
+        memcpy(&nt, nbp + SZ_NBPHDR, SZ_NBPTUPLE);
+
+        if (nh.nh_op == NBPOP_LKUPREPLY || nh.nh_op == NBPOP_FWDREPLY) {
+            uint16_t reply_net = ntohs(nt.nt_net);
+            struct interface *reply_iface = NULL;
+
+            for (iface = interfaces; iface != NULL; iface = iface->i_next) {
+                if ((iface->i_flags & IFACE_CONFIG) == 0 || iface->i_rt == NULL) {
+                    continue;
+                }
+                uint16_t firstnet = ntohs(iface->i_rt->rt_firstnet);
+                uint16_t lastnet = ntohs(iface->i_rt->rt_lastnet);
+                if (reply_net >= firstnet && reply_net <= lastnet) {
+                    reply_iface = iface;
+                    break;
+                }
+            }
+
+            if (reply_iface != NULL) {
+                memset(&sat, 0, sizeof(sat));
+#ifdef BSD4_4
+                sat.sat_len = sizeof(struct sockaddr_at);
+#endif
+                sat.sat_family = AF_APPLETALK;
+                sat.sat_addr.s_net = nt.nt_net; /* already network order */
+                sat.sat_addr.s_node = nt.nt_node;
+                sat.sat_port = nt.nt_port;
+
+                for (ap = reply_iface->i_ports; ap != NULL; ap = ap->ap_next) {
+                    if (ap->ap_port == 2) {
+                        break;
+                    }
+                }
+                if (ap == NULL) {
+                    ap = reply_iface->i_ports;
+                }
+
+                if (ap != NULL) {
+                    if (sendto(ap->ap_fd, data + 12, len - 12, 0,
+                               (struct sockaddr *)&sat, sizeof(sat)) < 0) {
+                        LOG(log_warning, logtype_atalkd,
+                            "aurp_handle_data: reply forward sendto(%u.%u.%u) failed: %s",
+                            reply_net, nt.nt_node, nt.nt_port, strerror(errno));
+                    } else {
+                        LOG(log_debug, logtype_atalkd,
+                            "aurp_handle_data: forwarded NBP reply to %u.%u.%u",
+                            reply_net, nt.nt_node, nt.nt_port);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /*
+     * Handle NBP FwdReq addressed to a local router, even if the destination
+     * socket is not 2. Some peers target the router node directly with a
+     * non-NBP socket; in that case, treat it as a router-directed FwdReq.
+     */
+    if ((uint8_t)data[12] == DDPTYPE_NBP && ddp_len >= 13 + SZ_NBPHDR) {
+        struct nbphdr nh;
+        memcpy(&nh, data + 13, SZ_NBPHDR);
+
+        if (nh.nh_op == NBPOP_FWD) {
+            LOG(log_debug, logtype_atalkd,
+                "aurp_handle_data: treating NBP FwdReq as router-directed (dst %u.%u.%u)",
+                dst_net, dst_node, dst_socket);
+            /* Convert to LkUp before broadcasting */
+            nh.nh_op = NBPOP_LKUP;
+            memcpy(data + 13, &nh, SZ_NBPHDR);
+
+            /* Try to resolve the requested zone and ensure multicast is configured */
+            if (ddp_len >= 13 + SZ_NBPHDR + SZ_NBPTUPLE + 1) {
+                unsigned char *nbp = (unsigned char *)data + 13;
+                int nbp_len = ddp_len - 13;
+                unsigned char *q = nbp + SZ_NBPHDR + SZ_NBPTUPLE;
+                unsigned char *nbp_end = nbp + nbp_len;
+                unsigned char *zone_name = NULL;
+                unsigned char zone_len = 0;
+
+                if (q < nbp_end) {
+                    unsigned char objlen = *q++;
+                    if (q + objlen <= nbp_end) {
+                        q += objlen;
+                        if (q < nbp_end) {
+                            unsigned char typelen = *q++;
+                            if (q + typelen <= nbp_end) {
+                                q += typelen;
+                                if (q < nbp_end) {
+                                    zone_len = *q++;
+                                    if (q + zone_len <= nbp_end) {
+                                        zone_name = q;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (zone_name != NULL && zone_len > 0) {
+                    struct ziptab *zt = NULL;
+                    struct list *l;
+                    unsigned char *lookup_name = zone_name;
+                    unsigned char lookup_len = zone_len;
+
+                    if (lookup_len == 1 && *lookup_name == '*') {
+                        if (dest_iface->i_rt != NULL && dest_iface->i_rt->rt_zt != NULL) {
+                            zt = (struct ziptab *)dest_iface->i_rt->rt_zt->l_data;
+                            lookup_name = (unsigned char *)zt->zt_name;
+                            lookup_len = zt->zt_len;
+                        }
+                    }
+
+                    if (zt == NULL && dest_iface->i_rt != NULL) {
+                        for (l = dest_iface->i_rt->rt_zt; l; l = l->l_next) {
+                            zt = (struct ziptab *)l->l_data;
+                            if (zt->zt_len == lookup_len &&
+                                    strndiacasecmp(zt->zt_name, (char *)lookup_name, lookup_len) == 0) {
+                                break;
+                            }
+                        }
+                        if (l == NULL) {
+                            zt = NULL;
+                        }
+                    }
+
+                    if (zt != NULL && zt->zt_bcast == NULL) {
+                        if (zone_bcast(zt) < 0) {
+                            LOG(log_warning, logtype_atalkd,
+                                "aurp_handle_data: zone_bcast failed for zone %.*s",
+                                lookup_len, (char *)lookup_name);
+                        } else if (addmulti(dest_iface->i_name, zt->zt_bcast) < 0) {
+                            LOG(log_warning, logtype_atalkd,
+                                "aurp_handle_data: addmulti failed for zone %.*s on %s: %s",
+                                lookup_len, (char *)lookup_name, dest_iface->i_name,
+                                strerror(errno));
+                        }
+                    }
+
+                    if (zt != NULL && aurp_try_zone_multicast(dest_iface, zt,
+                                                             (unsigned char *)data,
+                                                             ddp_len, 2)) {
+                        LOG(log_debug, logtype_atalkd,
+                            "aurp_handle_data: zone-multicast NBP LkUp to %.*s on %s",
+                            lookup_len, (char *)lookup_name, dest_iface->i_name);
+                        return;
+                    }
+                }
+            }
+
+            /* Broadcast on local network using NBP socket */
+            memset(&sat, 0, sizeof(sat));
+#ifdef BSD4_4
+            sat.sat_len = sizeof(struct sockaddr_at);
+#endif
+            sat.sat_family = AF_APPLETALK;
+            sat.sat_addr.s_net = 0;
+            sat.sat_addr.s_node = ATADDR_BCAST;
+            sat.sat_port = 2;
+
+            for (ap = dest_iface->i_ports; ap; ap = ap->ap_next) {
+                if (ap->ap_port == 2) {
+                    break;
+                }
+            }
+            if (ap == NULL) {
+                ap = dest_iface->i_ports;
+            }
+
+            if (ap != NULL) {
+                if (sendto(ap->ap_fd, data + 12, len - 12, 0,
+                           (struct sockaddr *)&sat, sizeof(sat)) < 0) {
+                    LOG(log_warning, logtype_atalkd,
+                        "aurp_handle_data: broadcast sendto failed: %s", strerror(errno));
+                } else {
+                    LOG(log_debug, logtype_atalkd,
+                        "aurp_handle_data: broadcasted NBP FwdReq as LkUp to local network %u",
+                        dst_net);
+                }
+            }
+            return;
+        }
     }
 
     /*
@@ -1494,6 +2233,103 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         ddp_type = (uint8_t)data[12];  /* DDP type follows 12-byte header */
 
         if (dst_socket == 2 && ddp_type == DDPTYPE_NBP) {
+            struct nbphdr nh;
+
+            if (ddp_len >= 13 + SZ_NBPHDR) {
+                memcpy(&nh, data + 13, SZ_NBPHDR);
+            } else {
+                memset(&nh, 0, sizeof(nh));
+            }
+
+            /* If this is an NBP FwdReq, convert to LkUp before broadcasting */
+            if (ddp_len >= 13 + SZ_NBPHDR) {
+                if (nh.nh_op == NBPOP_FWD) {
+                    nh.nh_op = NBPOP_LKUP;
+                    memcpy(data + 13, &nh, SZ_NBPHDR);
+                }
+            }
+
+            /* Try to resolve the requested zone and ensure multicast is configured */
+            if (ddp_len >= 13 + SZ_NBPHDR + SZ_NBPTUPLE + 1 && dest_iface != NULL) {
+                unsigned char *nbp = (unsigned char *)data + 13;
+                int nbp_len = ddp_len - 13;
+                unsigned char *q = nbp + SZ_NBPHDR + SZ_NBPTUPLE;
+                unsigned char *nbp_end = nbp + nbp_len;
+                unsigned char *zone_name = NULL;
+                unsigned char zone_len = 0;
+
+                if (q < nbp_end) {
+                    unsigned char objlen = *q++;
+                    if (q + objlen <= nbp_end) {
+                        q += objlen;
+                        if (q < nbp_end) {
+                            unsigned char typelen = *q++;
+                            if (q + typelen <= nbp_end) {
+                                q += typelen;
+                                if (q < nbp_end) {
+                                    zone_len = *q++;
+                                    if (q + zone_len <= nbp_end) {
+                                        zone_name = q;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (zone_name != NULL && zone_len > 0) {
+                    struct ziptab *zt = NULL;
+                    struct list *l;
+                    unsigned char *lookup_name = zone_name;
+                    unsigned char lookup_len = zone_len;
+
+                    if (lookup_len == 1 && *lookup_name == '*') {
+                        if (dest_iface->i_rt != NULL && dest_iface->i_rt->rt_zt != NULL) {
+                            zt = (struct ziptab *)dest_iface->i_rt->rt_zt->l_data;
+                            lookup_name = (unsigned char *)zt->zt_name;
+                            lookup_len = zt->zt_len;
+                        }
+                    }
+
+                    if (zt == NULL && dest_iface->i_rt != NULL) {
+                        for (l = dest_iface->i_rt->rt_zt; l; l = l->l_next) {
+                            zt = (struct ziptab *)l->l_data;
+                            if (zt->zt_len == lookup_len &&
+                                    strndiacasecmp(zt->zt_name, (char *)lookup_name, lookup_len) == 0) {
+                                break;
+                            }
+                        }
+                        if (l == NULL) {
+                            zt = NULL;
+                        }
+                    }
+
+                    if (zt != NULL) {
+                        if (zt->zt_bcast == NULL) {
+                            if (zone_bcast(zt) < 0) {
+                                LOG(log_warning, logtype_atalkd,
+                                    "aurp_handle_data: zone_bcast failed for zone %.*s",
+                                    lookup_len, (char *)lookup_name);
+                            } else if (addmulti(dest_iface->i_name, zt->zt_bcast) < 0) {
+                                LOG(log_warning, logtype_atalkd,
+                                    "aurp_handle_data: addmulti failed for zone %.*s on %s: %s",
+                                    lookup_len, (char *)lookup_name, dest_iface->i_name,
+                                    strerror(errno));
+                            }
+                        }
+
+                        if (aurp_try_zone_multicast(dest_iface, zt,
+                                                    (unsigned char *)data,
+                                                    ddp_len, dst_socket)) {
+                            LOG(log_debug, logtype_atalkd,
+                                "aurp_handle_data: zone-multicast NBP LkUp to %.*s on %s",
+                                lookup_len, (char *)lookup_name, dest_iface->i_name);
+                            return;
+                        }
+                    }
+                }
+            }
+
             /* NBP packet to router - broadcast it on local network */
             LOG(log_debug, logtype_atalkd,
                 "aurp_handle_data: broadcasting NBP packet from %u.%u to network %u",
@@ -1661,6 +2497,63 @@ int aurp_send_data(uint16_t dst_net, char *ddp_data, int ddp_len)
         "aurp_send_data: sent %d byte packet to %s for network %u",
         len, inet_ntoa(peer->ap_addr), dst_net);
 
+    return 0;
+}
+
+/* Send a DDP packet via AURP directly to a specific peer */
+int aurp_send_data_to_peer(struct aurp_peer *peer, char *ddp_data, int ddp_len)
+{
+    char buf[AURP_MAX_PKT_SIZE];
+    int len = 0;
+    int n;
+
+    if (peer == NULL) {
+        return -1;
+    }
+
+    /* Only send if peer is connected */
+    if (peer->ap_recv_state != AURP_RECV_CONNECTED) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_send_data_to_peer: peer %s not connected (state=%d)",
+            inet_ntoa(peer->ap_addr), peer->ap_recv_state);
+        return -1;
+    }
+
+    /* Check packet size */
+    if (ddp_len > AURP_MAX_PKT_SIZE - 50) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_send_data_to_peer: packet too large (%d bytes)", ddp_len);
+        return -1;
+    }
+
+    /* Build domain header for AppleTalk data packet */
+    n = aurp_build_domain_header(buf + len, sizeof(buf) - len, peer, AURP_PKT_APPLETALK);
+    if (n < 0) return -1;
+    len += n;
+
+    /* Copy DDP packet data */
+    memcpy(buf + len, ddp_data, ddp_len);
+    len += ddp_len;
+
+    /* Send to peer */
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr = peer->ap_addr;
+    sin.sin_port = htons(aurp_config.ac_port);
+
+    if (sendto(aurp_fd, buf, len, 0, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+        LOG(log_warning, logtype_atalkd,
+            "aurp_send_data_to_peer: sendto(%s) failed: %s",
+            inet_ntoa(peer->ap_addr), strerror(errno));
+        return -1;
+    }
+
+    peer->ap_last_send = time(NULL);
+
+    LOG(log_error, logtype_atalkd,
+        "aurp_send_data_to_peer: sent %d byte packet to %s",
+        len, inet_ntoa(peer->ap_addr));
     return 0;
 }
 

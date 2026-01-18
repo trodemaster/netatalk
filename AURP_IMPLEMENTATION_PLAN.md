@@ -4,6 +4,8 @@
 
 This document details the plan for implementing AURP (AppleTalk Update-Based Routing Protocol, RFC 1504) IP tunneling in the atalkd daemon, allowing AppleTalk networks to be connected across IP networks.
 
+**Packet specifications are maintained in [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md) and should not be duplicated here.**
+
 **Date**: January 2026  
 **Goal**: Implement AURP IP tunneling directly in netatalk/atalkd to enable standalone AppleTalk routing without external dependencies  
 **Target**: `/home/blake/code/netatalk/etc/atalkd/` (C)  
@@ -876,23 +878,7 @@ After extensive byte-level debugging with custom logging in `nbp.c` and `aurp.c`
 9. ✅ NBP data length now calculated as `(end - nbpop)` not `(len - 1)`
 10. ✅ **DDP source address now uses LOCAL ROUTER address (650.37.2) not Mac (650.73.252)** - Critical for AURP NBP forwarding
 
-**Verified Packet Structure** (from HEX dump):
-```
-DDP Header (13 bytes):
-  00 20    = Hop(0) + Length(32) ✓
-  00 00    = Checksum ✓
-  6f e8    = Dest Net 0x6fe8 ✓
-  00       = Dest Node (broadcast) ✓
-  02       = Dest Socket ✓
-  02 8a    = Source Net 0x028a (650) ✓ [ORIGINAL MAC!]
-  49       = Source Node (73) ✓ [ORIGINAL MAC!]
-  fc       = Source Socket (252) ✓ [ORIGINAL MAC!]
-  02       = DDP Type (NBP) ✓
-
-NBP Data:
-  41 c3    = Function(4=FwdReq), Count(1), ID(0xc3) ✓
-  ...tuples follow...
-```
+**Packet format details**: Moved to [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md).
 
 **Root Cause of All Bugs**: The `struct ddpehdr` in `sys/netatalk/ddp.h` has fields in the WRONG ORDER for wire format. Solution: Manual byte-by-byte construction/parsing.
 
@@ -905,11 +891,7 @@ After capturing and analyzing jrouter's actual packets vs atalkd's, discovered t
 - If DDP source is the Mac's address, remote routers try to route directly to the Mac (which they can't reach across AURP)
 - If DDP source is the local router's address, replies come back through AURP to us, then we forward to the Mac
 
-**jrouter packet analysis** (from tcpdump):
-```
-DDP Source: 73.2.252 (jrouter's LOCAL address, NOT the Mac!)
-NBP Tuple:  650.73.252 (Mac's address for the reply)
-```
+**jrouter packet analysis**: Packet-level examples are documented in [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md).
 
 **Fixed in `/home/blake/code/netatalk/etc/atalkd/nbp.c`**:
 ```c
@@ -1102,39 +1084,7 @@ Captured reference AURP packets from jrouter v0.0.21-dev operating in seed mode 
 
 ### Packet Format Analysis
 
-Captured packets from `/tmp/aurp_reference2.pcap` and analyzed the Open-Req packet format:
-
-#### jrouter Open-Req Packet (33 bytes UDP payload)
-
-```
-Domain Header (22 bytes):
-  Dest DI:  07 01 00 00 [peer_ip]    (8 bytes - len=7, auth=1, dist=0, IP)
-  Src DI:   07 01 00 00 [local_ip]   (8 bytes)
-  Version:  00 01                     (2 bytes)
-  Reserved: 00 00                     (2 bytes)
-  PktType:  00 03                     (2 bytes = Routing)
-
-Transport Header (8 bytes):
-  ConnID:   [varies]                  (2 bytes)
-  Sequence: 00 00                     (2 bytes)
-  Command:  00 08                     (2 bytes = Open-Req)
-  Flags:    78 00                     (2 bytes = SUI+NA+ND+NC)
-
-Open-Req Data (3 bytes):
-  Version:  00 01                     (2 bytes = AURP v1)
-  OptCount: 00                        (1 byte = 0 options)
-```
-
-#### jrouter Open-Rsp Packet (36 bytes UDP payload)
-
-```
-Domain Header (22 bytes): same structure
-Transport Header (8 bytes): same structure with Command=00 09
-
-Open-Rsp Data (6 bytes):
-  RateOrErr: 00 01                    (2 bytes = rate 1, or error code if negative)
-  OptCount:  00                       (1 byte = 0 options)
-```
+Moved to [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md). This implementation plan should not duplicate packet specifications.
 
 ### Critical Bug Found in netatalk AURP Implementation
 
@@ -2114,7 +2064,7 @@ Packet format was verified through:
 
 1. **struct ddpehdr Issue**: The `struct ddpehdr` in `sys/netatalk/ddp.h` has fields in C struct order, NOT wire format order. Solution: Manual byte-by-byte construction.
 
-2. **DDP Source Address**: Must use router's address (not Mac's) as DDP source, with Mac's address in NBP tuple reply-to field.
+2. **DDP Source Address (FwdReq)**: Use the original requester's address as DDP source for AURP FwdReq encapsulation, while preserving the tuple reply‑to address.
 
 3. **NBP Operation Conversion**: BrRq (0x01) must be converted to FwdReq (0x04) for AURP forwarding.
 
@@ -2127,6 +2077,12 @@ Packet format was verified through:
 - ✅ NBP Header and Tuples: Verified correct
 - ✅ Byte Ordering: All fields big-endian, verified
 - ✅ Packet Lengths: Verified against jrouter captures
+
+### Operational Findings (Jan 17, 2026)
+
+- Long capture on UDP/387 shows inbound AURP control packets only (ZI/Open/Tickle). No inbound AppleTalk data (type $0x0002$) observed.
+- Outbound AURP AppleTalk data is present, but peers are not returning AppleTalk data payloads.
+- Current blocker appears to be peer‑side behavior or routing policy rather than local packet formatting.
 
 ## Development Guidelines
 

@@ -216,12 +216,18 @@ int aurp_send_ri_upd(struct aurp_peer *peer);
 int aurp_send_rd(struct aurp_peer *peer, int16_t error);
 int aurp_send_tickle(struct aurp_peer *peer);
 int aurp_send_tickle_ack(struct aurp_peer *peer);
+
+/* Raw EtherTalk capture for local->AURP forwarding (Linux only) */
+int aurp_raw_init(void);
+void aurp_raw_input(int fd);
 int aurp_send_zi_req(struct aurp_peer *peer, uint16_t *nets, int count);
 int aurp_send_zi_rsp(struct aurp_peer *peer, int last);
+int aurp_send_zi_rsp_for_nets(struct aurp_peer *peer, const uint16_t *nets, int count);
 
 /* Data forwarding functions */
 struct aurp_peer *aurp_find_peer_for_net(uint16_t net);
 int aurp_send_data(uint16_t dst_net, char *ddp_data, int ddp_len);
+int aurp_send_data_to_peer(struct aurp_peer *peer, char *ddp_data, int ddp_len);
 
 /* Packet building helpers */
 int aurp_build_header(char *buf, int buflen, uint16_t conn_id, uint16_t seq,

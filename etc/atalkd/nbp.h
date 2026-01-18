@@ -12,9 +12,13 @@ struct nbptab {
     struct interface    *nt_iface;
 };
 
+struct aurp_peer;
+
 extern struct nbptab	*nbptab;
 
 int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data,
                int len);
+
+/* Track pending AURP-forwarded NBP requests so replies can be tunneled back. */
 
 #endif

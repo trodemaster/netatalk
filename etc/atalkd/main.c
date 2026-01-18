@@ -88,6 +88,7 @@ static int		stable = 0, noparent = 0;
 static int		ninterfaces;
 static int		defphase = IFACE_PHASE2;
 static int		nfds = 0;
+static int		aurp_raw_fd = -1;
 static fd_set		fds;
 static char		Packet[PKTSZ];
 static char		*version = VERSION;
@@ -1249,6 +1250,14 @@ int main(int ac, char **av)
                     nfds = aurp_fd + 1;
                 }
             }
+
+            aurp_raw_fd = aurp_raw_init();
+            if (aurp_raw_fd >= 0) {
+                FD_SET(aurp_raw_fd, &fds);
+                if (aurp_raw_fd >= nfds) {
+                    nfds = aurp_raw_fd + 1;
+                }
+            }
         } else {
             LOG(log_error, logtype_atalkd, "AURP initialization failed");
         }
@@ -1318,6 +1327,20 @@ int main(int ac, char **av)
             }
 
             aurp_input(aurp_fd);
+
+            if (sigprocmask(SIG_SETMASK, &old_set, NULL) < 0) {
+                LOG(log_error, logtype_atalkd, "sigprocmask old set: %s", strerror(errno));
+                atalkd_exit(1);
+            }
+        }
+
+        if (aurp_raw_fd >= 0 && FD_ISSET(aurp_raw_fd, &readfds)) {
+            if (sigprocmask(SIG_BLOCK, &signal_set, &old_set) < 0) {
+                LOG(log_error, logtype_atalkd, "sigprocmask: %s", strerror(errno));
+                atalkd_exit(1);
+            }
+
+            aurp_raw_input(aurp_raw_fd);
 
             if (sigprocmask(SIG_SETMASK, &old_set, NULL) < 0) {
                 LOG(log_error, logtype_atalkd, "sigprocmask old set: %s", strerror(errno));
@@ -1509,6 +1532,20 @@ smaller net range.", iface->i_name, ntohs(first), ntohs(last), strerror(errno));
             if (ap->ap_fd > nfds) {
                 nfds = ap->ap_fd;
             }
+        }
+    }
+
+    if (aurp_fd >= 0) {
+        FD_SET(aurp_fd, &fds);
+        if (aurp_fd > nfds) {
+            nfds = aurp_fd;
+        }
+    }
+
+    if (aurp_raw_fd >= 0) {
+        FD_SET(aurp_raw_fd, &fds);
+        if (aurp_raw_fd > nfds) {
+            nfds = aurp_raw_fd;
         }
     }
 

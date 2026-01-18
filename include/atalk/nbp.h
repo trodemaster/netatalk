@@ -80,14 +80,15 @@ struct nbpnve {
 #define NBPOP_BRRQ	 0x1
 #define NBPOP_LKUP	 0x2
 #define NBPOP_LKUPREPLY	 0x3
-#define NBPOP_FWD	 0x4
-#define NBPOP_RGSTR	 0x7
+#define NBPOP_FWD	  0x4
+#define NBPOP_FWDREPLY  0x5
+#define NBPOP_RGSTR	  0x7
 #define NBPOP_UNRGSTR	 0x8
 #define NBPOP_CONFIRM    0x9
 #define NBPOP_OK	 0xa  /* NBPOP_STATUS_REPLY */
 #define NBPOP_CLOSE_NOTE 0xb
 
-#define NBPOP_ERROR	 0xf
+#define NBPOP_ERROR	  0xf
 
 #define NBPMATCH_NOGLOB	(1<<1)
 #define NBPMATCH_NOZONE	(1<<2)
