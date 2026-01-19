@@ -676,15 +676,27 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     uint8_t tuple_node = tuple_start[2];
                     uint8_t tuple_socket = tuple_start[3];
                     
-                    /* Use the original requester as the DDP source, matching jrouter. */
-                    LOG(log_error, logtype_atalkd,
+                    /*
+                     * DDP source policy for AURP‑forwarded NBP:
+                     * - RFC 1504 is silent on DDP source selection for forwarded NBP.
+                     * - Inside Macintosh focuses on NBP tuple reply‑to (which must
+                     *   remain the original requester for return routing), but does
+                     *   not mandate DDP source for tunnel forwarding.
+                     * - jrouter implementation forwards with the original requester's
+                     *   DDP source (see jrouter/router/nbp.go: outDDP SrcNet/SrcNode/SrcSocket
+                     *   taken from incoming packet). This is the behavior we match here.
+                     *
+                     * Alternate policy (router as DDP source) has been tested but is not
+                     * aligned with jrouter behavior; keep tuple reply‑to as requester either way.
+                     */
+                    LOG(log_debug, logtype_atalkd,
                         "DEBUG NBP TUPLE: from %u.%u.%u, tuple says respond to %u.%u.%u",
                         src_net, from->sat_addr.s_node, from->sat_port,
                         tuple_net, tuple_node, tuple_socket);
                     uint16_t src_net_host = src_net;
                     uint8_t src_node = from->sat_addr.s_node;
                     uint8_t src_socket = from->sat_port;
-                    LOG(log_error, logtype_atalkd,
+                    LOG(log_debug, logtype_atalkd,
                         "DEBUG DDP SOURCE: Using REQUESTER address %u.%u.%u",
                         src_net_host, src_node, src_socket);
                     
@@ -694,11 +706,11 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     for (int i = 0; i < (nbp_data_len < 20 ? nbp_data_len : 20); i++) {
                         hex_pos += sprintf(hex_buf + hex_pos, "%02x ", (unsigned char)nbpop[i]);
                     }
-                    LOG(log_error, logtype_atalkd,
+                    LOG(log_debug, logtype_atalkd,
                         "DEBUG NBP DATA HEX (first %d bytes): %s",
                         (nbp_data_len < 20 ? nbp_data_len : 20), hex_buf);
                     
-                    LOG(log_error, logtype_atalkd,
+                    LOG(log_debug, logtype_atalkd,
                         "DEBUG: AURP path executing! nbp_data_len=%d total_len=%d len=%d",
                         nbp_data_len, total_len, len);
 
@@ -763,7 +775,7 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     }
 
                     /* DEBUG: Verify DDP packet construction */
-                    LOG(log_error, logtype_atalkd,
+                    LOG(log_debug, logtype_atalkd,
                         "DEBUG DDP: pos=%d bytes[0-1]=%02x%02x bytes[12]=%02x total_len=%d",
                         pos, ddp_packet[0], ddp_packet[1], ddp_packet[12], total_len);
 

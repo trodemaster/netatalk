@@ -854,6 +854,78 @@ sudo ./tools/aurp_probe.py --target 97.126.87.58 --mode ri-req
 
 ---
 
+## jrouter NBP-over-AURP End-to-End Flow (Code-Inspected)
+
+This section **adds** jrouter implementation observations (no changes to existing descriptions). It traces a complete lookup flow from a local test system through the tunnel to a remote zone and back. Sources are jrouter code paths.
+
+### A) Local test system → local router (BrRq)
+
+1) **EtherTalk receives NBP BrRq**
+  - Entry point: [jrouter/router/etalk_port.go](jrouter/router/etalk_port.go)
+  - NBP packets on socket 2 are dispatched to `HandleNBP()`.
+
+2) **BrRq handling**
+  - Handler: [jrouter/router/nbp.go](jrouter/router/nbp.go)
+  - `handleNBPBrRq()` identifies routes for the requested zone.
+
+### B) Local router → remote router (FwdReq over AURP)
+
+3) **Convert BrRq → FwdReq for non‑local zones**
+  - Code path: [jrouter/router/nbp.go](jrouter/router/nbp.go)
+  - NBP operation changes to `FwdReq` and is marshaled.
+  - **DDP header for the FwdReq** (jrouter fields):
+    - `SrcNet/SrcNode/SrcSocket`: copied from incoming packet (original requester).
+    - `DstNet`: `route.NetStart` (remote network range start).
+    - `DstNode`: `0x00` (any router on destination network).
+    - `DstSocket`: `2` (NBP).
+    - `Proto`: NBP.
+
+4) **Route output to AURP peer**
+  - `router.Output()` uses the route table to select target.
+  - If the target is an AURP peer, forwarding uses AURP encapsulation.
+  - Output path: [jrouter/router/router.go](jrouter/router/router.go) → [jrouter/router/aurp_peer.go](jrouter/router/aurp_peer.go)
+  - `AURPPeer.Forward()` marshals the DDP extended header + payload and wraps it into an AURP AppleTalk Data packet (`0x0002`).
+
+### C) Remote router receives FwdReq over AURP
+
+5) **AURP inbound → NBP FwdReq handler**
+  - Entry: [jrouter/router/nbp_aurp.go](jrouter/router/nbp_aurp.go)
+  - `HandleNBPFromAURP()` accepts only NBP `FwdReq` and forwards to `handleNBPFwdReq()`.
+
+6) **Convert FwdReq → LkUp and zone‑multicast**
+  - Code path: [jrouter/router/nbp.go](jrouter/router/nbp.go)
+  - Converts to `LkUp`, then updates DDP destination for local zone broadcast:
+    - `DstNet`: `0x0000`
+    - `DstNode`: `0xFF` (broadcast node)
+  - Sends via `ZoneMulticast(zone)` on the local EtherTalk port.
+
+### D) Remote host replies → remote router → tunnel back
+
+7) **Remote host sends LkUpReply**
+  - The reply’s DDP destination uses the **tuple reply‑to** address (original requester).
+  - This is consistent with Inside AppleTalk guidance; jrouter’s reply helper (`helloWorldThisIsMe`) also targets tuple address when it replies.
+
+8) **Remote router forwards reply toward requester**
+  - On receive, if `DstNet` is not local, EtherTalk port forwards via the router:
+    - [jrouter/router/etalk_port.go](jrouter/router/etalk_port.go)
+    - `router.Forward()` increments hop and routes to the AURP peer.
+  - AURP encapsulation happens again in `AURPPeer.Forward()`:
+    - [jrouter/router/aurp_peer.go](jrouter/router/aurp_peer.go)
+
+### E) Local router receives reply and delivers to test system
+
+9) **AURP inbound reply → local EtherTalk**
+  - The encapsulated DDP LkUpReply is delivered to the local network.
+  - Because the tuple reply‑to is the original requester, it should arrive at the test system’s address on socket 2.
+
+**Key jrouter behavior to preserve in netatalk**:
+- FwdReq DDP source equals the original requester (copied from inbound DDP). See [jrouter/router/nbp.go](jrouter/router/nbp.go).
+- FwdReq DDP destination is `DstNet=route.NetStart`, `DstNode=0x00`, `DstSocket=2` (NBP). See [jrouter/router/nbp.go](jrouter/router/nbp.go).
+- Remote router converts FwdReq → LkUp and sets `DstNet=0x0000`, `DstNode=0xFF`, then zone‑multicasts. See [jrouter/router/nbp.go](jrouter/router/nbp.go).
+- AURP encapsulation uses AppleTalk Data packet type `0x0002` for the raw DDP payload. See [jrouter/router/aurp_peer.go](jrouter/router/aurp_peer.go).
+
+---
+
 ## References
 
 ### Official Specifications

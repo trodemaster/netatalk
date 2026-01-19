@@ -2183,5 +2183,65 @@ This document consolidates all packet format findings and serves as the definiti
 
 ---
 
+## jrouter vs netatalk AURP Flow: Discrepancies & Plan
+
+This section compares the **jrouter packet flow** to **netatalk’s AURP flow** and identifies implementation discrepancies. It references [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md) for packet specifics.
+
+### Discrepancies
+
+1) **DDP Source Address in FwdReq (policy mismatch)**
+    - **jrouter**: `FwdReq` DDP source **preserves original requester** (copied from inbound DDP) and uses tuple reply‑to for responses.
+    - **netatalk**: This has flipped between **router source** and **requester source** in `nbp.c`.
+    - **Risk**: Remote routers/hosts may drop or misroute replies depending on which they expect.
+    - **Reference**: [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md) “jrouter NBP‑over‑AURP End‑to‑End Flow”.
+
+2) **NBP FwdReq return path handling**
+    - **jrouter**: Remote router converts `FwdReq → LkUp`, zone‑multicasts, replies target tuple address and are routed back via AURP.
+    - **netatalk**: Inbound reply forwarding logic exists but depends on correct tuple parsing and local interface matching in `aurp_handle_data()`.
+    - **Risk**: Replies can be dropped if tuple parsing or interface selection fails.
+    - **Reference**: [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md) “NBP reply‑to” and “Common Bugs and Fixes”.
+
+3) **Directed vs broadcast lookup behavior**
+    - **jrouter**: Converts `FwdReq` to `LkUp` and uses **zone multicast** with `DstNet=0x0000`, `DstNode=0xFF`.
+    - **netatalk**: Implements zone multicast, but behavior depends on ZIP/zone multicast setup; failures fall back to broadcast.
+    - **Risk**: Missing zone multicast may reduce remote response rates.
+    - **Reference**: [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md) “Converting BrRq to FwdReq” and “NBP tuple address field”.
+
+4) **NBP tool behavior vs daemon forwarding**
+    - **jrouter**: FwdReq handling happens in router path and routes through AURP.
+    - **netatalk tooling**: `nbplkup -f` uses `NBPOP_FWD` but **netddp** returns “Network is unreachable” when routes aren’t resolved at the socket layer.
+    - **Risk**: Local CLI tests may not reflect daemon forwarding path.
+    - **Reference**: [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md) “Verification Methods / Tools”.
+
+5) **DDP checksum usage**
+    - **jrouter**: Computes checksums on outbound DDP.
+    - **netatalk**: Added checksum generation for forwarded NBP; raw EtherTalk forwarding for non‑NBP may still rely on incoming checksum validity.
+    - **Risk**: Remote peers may drop packets with zero or invalid checksum.
+    - **Reference**: [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md) “DDP Extended Header” and checksum notes.
+
+### Plan to Address Discrepancies
+
+1) **Lock DDP source policy**
+    - Decide and document **single policy** (prefer jrouter behavior: requester as DDP source for FwdReq) in code and docs.
+    - Add a runtime log line (debug) showing source policy used per forwarded packet.
+
+2) **Strengthen reply forwarding path**
+    - Add targeted logging in `aurp_handle_data()` for tuple parse failures and selected interface.
+    - Validate tuple reply‑to and DDP dest mapping against jrouter examples.
+
+3) **Zone multicast readiness check**
+    - Ensure ZIP zone multicast addresses are built before FwdReq→LkUp forwarding.
+    - If missing, log a warning and fall back to broadcast (documented behavior).
+
+4) **Clarify tooling vs daemon paths**
+    - Document that `nbplkup -f` is not equivalent to router‑forwarded `FwdReq` if kernel routes are missing.
+    - Provide a daemon‑level test (pcap + `aurp_pcap_analyze.py`) as canonical verification.
+
+5) **Checksum validation**
+    - Confirm checksum is computed for all AURP‑forwarded DDP packets (NBP + non‑NBP forwarding path).
+    - Add a verification checklist item in [AURP_PACKET_DETAILS.md](AURP_PACKET_DETAILS.md) if needed.
+
+---
+
 **End of Implementation Plan**
 
