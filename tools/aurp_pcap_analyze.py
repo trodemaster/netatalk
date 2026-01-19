@@ -19,6 +19,20 @@ NBP_OPS = {
     0x05: "FwdReply",
 }
 
+AURP_CMDS = {
+    0x0001: "RI-Req",
+    0x0002: "RI-Rsp",
+    0x0003: "RI-Ack",
+    0x0004: "RI-Upd",
+    0x0005: "RD",
+    0x0006: "ZI-Req",
+    0x0007: "ZI-Rsp",
+    0x0008: "Open-Req",
+    0x0009: "Open-Rsp",
+    0x000e: "Tickle",
+    0x000f: "Tickle-Ack",
+}
+
 
 def read_pcap(path):
     with open(path, "rb") as f:
@@ -103,10 +117,17 @@ def summarize(path, local_ip=None, top_n=10, sample_inbound=False, sample_count=
     in_peers = Counter()
     out_peers = Counter()
     inbound_samples = []
+    outbound_samples = []
     in_ddp_types = Counter()
     out_ddp_types = Counter()
     in_nbp_ops = Counter()
     out_nbp_ops = Counter()
+    in_nbp_ops_by_peer = {}
+    out_nbp_ops_by_peer = {}
+    in_cmds = Counter()
+    out_cmds = Counter()
+    in_cmds_by_peer = {}
+    out_cmds_by_peer = {}
 
     for src, dst, payload in packets:
         if len(payload) < 22:
@@ -125,8 +146,15 @@ def summarize(path, local_ip=None, top_n=10, sample_inbound=False, sample_count=
                     if ddp_type == DDP_TYPE_NBP and len(ddp) >= 15:
                         nbp_op = (ddp[13] >> 4) & 0x0F
                         out_nbp_ops[nbp_op] += 1
+                        out_nbp_ops_by_peer.setdefault(dst, Counter())[nbp_op] += 1
+                if sample_inbound and len(outbound_samples) < sample_count:
+                    outbound_samples.append((src, dst, payload[:64]))
             elif pkt_type == AURP_PKT_ROUTING:
                 out_0003 += 1
+                if len(payload) >= 30:
+                    cmd = struct.unpack("!H", payload[26:28])[0]
+                    out_cmds[cmd] += 1
+                    out_cmds_by_peer.setdefault(dst, Counter())[cmd] += 1
         else:
             in_peers[src] += 1
             if pkt_type == AURP_PKT_APPLETALK:
@@ -138,10 +166,15 @@ def summarize(path, local_ip=None, top_n=10, sample_inbound=False, sample_count=
                     if ddp_type == DDP_TYPE_NBP and len(ddp) >= 15:
                         nbp_op = (ddp[13] >> 4) & 0x0F
                         in_nbp_ops[nbp_op] += 1
+                        in_nbp_ops_by_peer.setdefault(src, Counter())[nbp_op] += 1
                 if sample_inbound and len(inbound_samples) < sample_count:
                     inbound_samples.append((src, dst, payload[:64]))
             elif pkt_type == AURP_PKT_ROUTING:
                 in_0003 += 1
+                if len(payload) >= 30:
+                    cmd = struct.unpack("!H", payload[26:28])[0]
+                    in_cmds[cmd] += 1
+                    in_cmds_by_peer.setdefault(src, Counter())[cmd] += 1
 
     print(f"local_ip {local_ip}")
     print(f"in_type0002 {in_0002}")
@@ -179,11 +212,87 @@ def summarize(path, local_ip=None, top_n=10, sample_inbound=False, sample_count=
         for op, count in out_nbp_ops.most_common():
             print(f"  0x{op:01x} {NBP_OPS.get(op, 'Unknown')} {count}")
 
+    if in_cmds:
+        print("\nInbound AURP commands (type0003):")
+        for cmd, count in in_cmds.most_common():
+            print(f"  0x{cmd:04x} {AURP_CMDS.get(cmd, 'Unknown')} {count}")
+
+    if out_cmds:
+        print("\nOutbound AURP commands (type0003):")
+        for cmd, count in out_cmds.most_common():
+            print(f"  0x{cmd:04x} {AURP_CMDS.get(cmd, 'Unknown')} {count}")
+
+    if in_nbp_ops_by_peer:
+        print("\nInbound NBP ops by peer:")
+        peers = sorted(in_nbp_ops_by_peer.items(), key=lambda kv: -sum(kv[1].values()))
+        for peer, ops in peers[:top_n]:
+            summary = ", ".join(f"{NBP_OPS.get(op, 'Unknown')}={count}" for op, count in ops.most_common())
+            print(f"  {peer}: {summary}")
+
+    if out_nbp_ops_by_peer:
+        print("\nOutbound NBP ops by peer:")
+        peers = sorted(out_nbp_ops_by_peer.items(), key=lambda kv: -sum(kv[1].values()))
+        for peer, ops in peers[:top_n]:
+            summary = ", ".join(f"{NBP_OPS.get(op, 'Unknown')}={count}" for op, count in ops.most_common())
+            print(f"  {peer}: {summary}")
+
+    if in_cmds_by_peer:
+        print("\nInbound AURP commands by peer:")
+        peers = sorted(in_cmds_by_peer.items(), key=lambda kv: -sum(kv[1].values()))
+        for peer, cmds in peers[:top_n]:
+            summary = ", ".join(f"{AURP_CMDS.get(cmd, 'Unknown')}={count}" for cmd, count in cmds.most_common())
+            print(f"  {peer}: {summary}")
+
+    if out_cmds_by_peer:
+        print("\nOutbound AURP commands by peer:")
+        peers = sorted(out_cmds_by_peer.items(), key=lambda kv: -sum(kv[1].values()))
+        for peer, cmds in peers[:top_n]:
+            summary = ", ".join(f"{AURP_CMDS.get(cmd, 'Unknown')}={count}" for cmd, count in cmds.most_common())
+            print(f"  {peer}: {summary}")
+
     if inbound_samples:
         print("\nInbound type0002 samples (first 64 bytes):")
         for src, dst, payload in inbound_samples:
             hexbytes = " ".join(f"{b:02x}" for b in payload)
             print(f"  {src} -> {dst}: {hexbytes}")
+
+            ddp = payload[22:]
+            if len(ddp) >= 13:
+                hop_len = (ddp[0] << 8) | ddp[1]
+                hop = (hop_len >> 10) & 0x0F
+                length = hop_len & 0x03FF
+                checksum = (ddp[2] << 8) | ddp[3]
+                dst_net = (ddp[4] << 8) | ddp[5]
+                dst_node = ddp[6]
+                dst_socket = ddp[7]
+                src_net = (ddp[8] << 8) | ddp[9]
+                src_node = ddp[10]
+                src_socket = ddp[11]
+                ddp_type = ddp[12]
+                print(f"    DDP hop={hop} len={length} cksum=0x{checksum:04x}")
+                print(f"    DDP dst={dst_net}.{dst_node}.{dst_socket} src={src_net}.{src_node}.{src_socket} type=0x{ddp_type:02x}")
+
+    if outbound_samples:
+        print("\nOutbound type0002 samples (first 64 bytes):")
+        for src, dst, payload in outbound_samples:
+            hexbytes = " ".join(f"{b:02x}" for b in payload)
+            print(f"  {src} -> {dst}: {hexbytes}")
+
+            ddp = payload[22:]
+            if len(ddp) >= 13:
+                hop_len = (ddp[0] << 8) | ddp[1]
+                hop = (hop_len >> 10) & 0x0F
+                length = hop_len & 0x03FF
+                checksum = (ddp[2] << 8) | ddp[3]
+                dst_net = (ddp[4] << 8) | ddp[5]
+                dst_node = ddp[6]
+                dst_socket = ddp[7]
+                src_net = (ddp[8] << 8) | ddp[9]
+                src_node = ddp[10]
+                src_socket = ddp[11]
+                ddp_type = ddp[12]
+                print(f"    DDP hop={hop} len={length} cksum=0x{checksum:04x}")
+                print(f"    DDP dst={dst_net}.{dst_node}.{dst_socket} src={src_net}.{src_node}.{src_socket} type=0x{ddp_type:02x}")
 
 
 def main():
