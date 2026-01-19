@@ -28,12 +28,6 @@ def read_pcap(path):
         magic = struct.unpack("<I", gh[:4])[0]
         endian = "<" if magic == 0xA1B2C3D4 else ">"
         linktype = struct.unpack(endian + "I", gh[20:24])[0]
-        if linktype == 276:  # LINUX_SLL2
-            l2_len = 20
-        elif linktype == 113:  # LINUX_SLL
-            l2_len = 16
-        else:
-            l2_len = 0
 
         while True:
             ph = f.read(16)
@@ -43,15 +37,36 @@ def read_pcap(path):
             data = f.read(incl_len)
             if len(data) < incl_len:
                 break
-            yield l2_len, data
+            yield linktype, data
 
 
 def parse_udp387_packets(path):
     packets = []
     src_counter = Counter()
 
-    for l2_len, data in read_pcap(path):
-        if l2_len == 0 or len(data) < l2_len + 20:
+    for linktype, data in read_pcap(path):
+        if len(data) < 20:
+            continue
+
+        if linktype == 1:  # LINKTYPE_ETHERNET
+            if len(data) < 14:
+                continue
+            ethertype = struct.unpack("!H", data[12:14])[0]
+            l2_len = 14
+            if ethertype in (0x8100, 0x88A8):
+                if len(data) < 18:
+                    continue
+                l2_len += 4
+        elif linktype == 113:  # LINUX_SLL
+            l2_len = 16
+        elif linktype == 276:  # LINUX_SLL2
+            l2_len = 20
+        elif linktype in (0, 101, 228):  # NULL/RAW/IPV4
+            l2_len = 0
+        else:
+            continue
+
+        if len(data) < l2_len + 20:
             continue
         ip = data[l2_len:]
         vihl = ip[0]
