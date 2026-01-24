@@ -657,13 +657,28 @@ void aurp_handle_open_req(struct aurp_peer *peer, char *data, int len)
     /* Option count is 1 byte, followed by option tuples if count > 0 */
     /* For now, we ignore options */
 
-    /* Accept connection */
+    /* Accept connection - set our sender state to connected */
     peer->ap_send_state = AURP_SEND_CONNECTED;
     aurp_send_open_rsp(peer, 0);  /* 0 = success */
 
     LOG(log_info, logtype_atalkd,
-        "aurp_handle_open_req: accepted connection from %s",
+        "aurp_handle_open_req: accepted connection from %s (send_state=CONNECTED)",
         inet_ntoa(peer->ap_addr));
+
+    /*
+     * IMPORTANT: AURP connections are unidirectional. The peer's Open-Req
+     * establishes THEIR ability to send data TO us. We also need to establish
+     * OUR ability to receive data FROM them by sending our own Open-Req.
+     * This creates a bidirectional data path.
+     */
+    if (peer->ap_recv_state == AURP_RECV_UNCONNECTED) {
+        LOG(log_info, logtype_atalkd,
+            "aurp_handle_open_req: initiating reverse connection to %s",
+            inet_ntoa(peer->ap_addr));
+        peer->ap_recv_state = AURP_RECV_WAIT_OPEN_RSP;
+        peer->ap_send_retries = 0;
+        aurp_send_open_req(peer);
+    }
 }
 
 /* Handle Open-Rsp */
@@ -727,6 +742,17 @@ void aurp_handle_ri_req(struct aurp_peer *peer, char *data, int len)
 {
     LOG(log_info, logtype_atalkd, "aurp_handle_ri_req: from %s",
         inet_ntoa(peer->ap_addr));
+
+    /*
+     * Reset local sequence number to 1 for the new sender connection.
+     * The peer (as receiver) expects sequence numbers starting from 1.
+     * This is called on each RI-Req because the peer may have restarted
+     * their receiver state machine.
+     */
+    LOG(log_error, logtype_atalkd,
+        "aurp_handle_ri_req: RESETTING local_seq from %u to 1",
+        peer->ap_local_seq);
+    peer->ap_local_seq = 1;
 
     /* Send routing information response */
     aurp_send_ri_rsp(peer, 1);  /* 1 = last packet */
@@ -824,20 +850,21 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
                 } else {
                     free(nets);
                     peer->ap_recv_state = AURP_RECV_CONNECTED;
-                    LOG(log_info, logtype_atalkd,
-                        "aurp_handle_ri_rsp: connection fully established with %s (no zones needed)",
+                    LOG(log_error, logtype_atalkd,
+                        "*** RECV_CONNECTED: bidirectional connection with %s fully established (no zones needed) ***",
                         inet_ntoa(peer->ap_addr));
                 }
             } else {
                 /* Malloc failed, just connect without zones */
                 peer->ap_recv_state = AURP_RECV_CONNECTED;
-                LOG(log_warning, logtype_atalkd,
-                    "aurp_handle_ri_rsp: malloc failed, connecting without zones");
+                LOG(log_error, logtype_atalkd,
+                    "*** RECV_CONNECTED: bidirectional connection with %s established (malloc failed, no zones) ***",
+                    inet_ntoa(peer->ap_addr));
             }
         } else {
             peer->ap_recv_state = AURP_RECV_CONNECTED;
-            LOG(log_info, logtype_atalkd,
-                "aurp_handle_ri_rsp: connection fully established with %s (no routes)",
+            LOG(log_error, logtype_atalkd,
+                "*** RECV_CONNECTED: bidirectional connection with %s fully established (no routes) ***",
                 inet_ntoa(peer->ap_addr));
         }
     }
@@ -1288,8 +1315,8 @@ void aurp_handle_zi_rsp(struct aurp_peer *peer, char *data, int len)
 
         if (peer->ap_recv_state == AURP_RECV_WAIT_ZI_RSP) {
             peer->ap_recv_state = AURP_RECV_CONNECTED;
-            LOG(log_info, logtype_atalkd,
-                "aurp_handle_zi_rsp: connection fully established with zones from %s",
+            LOG(log_error, logtype_atalkd,
+                "*** RECV_CONNECTED: bidirectional connection with %s fully established (with zones) ***",
                 inet_ntoa(peer->ap_addr));
         }
     } else {
