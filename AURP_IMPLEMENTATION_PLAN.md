@@ -1215,9 +1215,24 @@ To resume this implementation effort:
 ### Known Issues / Future Work
 
 1. **Many peers offline**: Most peers from kalleboo.com/GT2024.txt don't respond (may require bidirectional peering)
-2. **NBP FwdReq**: Not implemented - TODO placeholder in `aurp_handle_data()`
-3. **GDZL**: GetDomainZoneList not implemented (rarely used)
-4. **Split horizon**: Each peer only advertises their local network, not AURP-learned routes (correct per RFC)
+2. **NBP replies not observed over AURP**: Inbound AURP AppleTalk data appears limited to FwdReq; no LkUpReply seen yet
+3. **BaroNet discovery returns zero results**: Targeted `nbp_zone_scan.py` scans for BaroNet yield 0 entries
+4. **GDZL**: GetDomainZoneList not implemented (rarely used)
+5. **Split horizon**: Each peer only advertises their local network, not AURP-learned routes (correct per RFC)
+
+### Recent Session Findings (January 24, 2026)
+
+- **AURP inbound data**: Captures show AppleTalk data (type $0x0002$) inbound only as NBP `FwdReq`, no `LkUpReply` observed.
+- **Local EtherTalk capture**: Only local NBP BrRq and RTMP traffic seen; no remote NBP replies delivered to the local network.
+- **BaroNet scans**: `nbp_zone_scan.py` with `--zone "BaroNet"` (fwd/lkup, router source, and no overrides) returned zero results.
+- **Address override behavior**: `nbplkup` source/dest overrides using non-local net/node addresses fail with “Bad address” or “Cannot assign requested address.”
+- **Stability fixes**: AURP hexdump hardened to prevent crashes; interface fallback added when `IFACE_CONFIG` flag not set but route range matches.
+
+### Remaining Tasks (Post-Jan 24, 2026)
+
+1. Capture simultaneous UDP/387 and EtherTalk ($0x809B$) traffic during a targeted BaroNet scan to confirm whether any inbound `LkUpReply` appears.
+2. Compare BaroNet AURP captures against the Jan 24 jrouter capture patterns (LkUpReply presence, checksum use, hop count).
+3. Validate if any peers are currently returning NBP replies (may be time-of-day/service availability).
 
 ### Test Configuration
 

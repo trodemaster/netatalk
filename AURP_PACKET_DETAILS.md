@@ -164,7 +164,7 @@ bytes[1] = hop_len & 0xFF;         // Low byte
 **RFC 1504 does not define a DDP source-address selection rule for forwarded NBP packets.**
 Any choice (requester vs router) is an implementation policy validated by interop testing.
 
-**Current policy (interop-driven):** use the router’s AppleTalk address as the DDP source and keep the requester in the NBP tuple reply‑to address.
+**Current policy (jrouter‑aligned):** use the requester’s DDP source for FwdReq and keep the requester in the NBP tuple reply‑to address.
 
 ```c
 // CORRECT: Use the requester (Mac) address
@@ -523,10 +523,10 @@ ddp_packet[pos++] = 0x00;  // Checksum low
 ### 3. Source Address Selection
 
 **For AURP-forwarded NBP packets**:
-- **DDP Source**: Router's address (AURP endpoint)
+- **DDP Source**: Requester's address (copied from inbound DDP)
 - **NBP Reply-to**: Requester's address (tuple reply‑to)
 
-This keeps the tunnel return path anchored at the router while still targeting the requester in the tuple.
+This matches jrouter’s FwdReq construction and preserves the requester end‑to‑end.
 
 ### 4. NBP Lookup Reply Handling
 
@@ -565,7 +565,7 @@ jrouter (Go-based AppleTalk router) serves as the reference implementation. Pack
 
 ### Key Findings
 
-1. **DDP Source Address (FwdReq)**: Router’s address appears as DDP source for forwarded lookups
+1. **DDP Source Address (FwdReq)**: Requester’s address appears as DDP source for forwarded lookups
 2. **NBP Reply-to**: Contains requester’s address in tuple
 3. **Packet Length**: 67 bytes for typical FwdReq with one tuple
 4. **Socket Selection**: Router uses socket 1 (RTMP) or socket 252 (matching Mac)
@@ -576,7 +576,7 @@ jrouter (Go-based AppleTalk router) serves as the reference implementation. Pack
 ### jrouter Code Flow
 
 1. **NBP Marshal** (`atalk/nbp/nbp.go:61-77`): Creates NBP packet with tuples
-2. **DDP Creation** (`router/nbp.go:142-155`): Creates DDP packet with router's address as source
+2. **DDP Creation** (`router/nbp.go:142-155`): Creates DDP packet with requester’s address as source
 3. **DDP Marshal** (`multitalk/pkg/ddp`): Marshals DDP header in correct byte order
 4. **AURP Wrapping** (`router/aurp_peer.go:159-166`): Wraps in AURP domain header
 
@@ -605,6 +605,33 @@ jrouter (Go-based AppleTalk router) serves as the reference implementation. Pack
 5. **Data Forwarding** (21:29:28 onwards):
    - Large data packets (472, 621 bytes) containing NBP registrations
    - AFP server announcements flowing through AURP tunnel
+
+### Jan 24, 2026 — BaroNet Capture (jrouter CLI)
+
+**Capture**: `tmp_packetcaptures/aurp_20260124_184627.pcap` (jrouter running on 192.168.0.214)
+
+**Outbound NBP FwdReq (AURP type 0x0002)**
+
+Observed 5 sample headers (all identical):
+
+- `hop=0`, `len=40`, `cksum=0x0000`
+- `DDP dst=2940.2.138`, `DDP src=213.2.253`
+- `NBP op=FwdReq (0x4)`
+
+**Inbound NBP LkUpReply (AURP type 0x0002)**
+
+Observed 5 sample headers (two patterns):
+
+- Pattern A: `hop=1`, `len=42`, `cksum=0x0000`, `DDP dst=650.11.124`, `DDP src=54529.253.2`
+- Pattern B: `hop=1`, `len=40`, `cksum=0x8a72`, `DDP dst=650.11.124`, `DDP src=54702.253.2`
+- `NBP op=LkUpReply (0x3)`
+
+**Key observations**
+
+1. jrouter’s forwarded FwdReq uses `hop=0` and `cksum=0x0000` consistently for this zone.
+2. Inbound LkUpReply packets show **mixed checksum usage** (0x0000 and non‑zero), so receivers must accept and validate both.
+3. Reply packets target the **requester’s socket** (`dst socket=124` in this capture), not socket 2, which matches NBP tuple reply‑to behavior.
+4. Inbound replies arrive with `hop=1`, indicating at least one routed hop before return.
 
 ### Peer Connectivity Patterns
 
@@ -676,19 +703,14 @@ This sequence traces machine discovery from AURP reception through NBP forwardin
 **Resolved**
 
 1) **Reply forwarding (LkUpReply/FwdReply)**
-  - netatalk now forwards inbound AURP NBP replies to the tuple reply‑to address instead of broadcasting them indiscriminately.
-  - Matches jrouter’s return‑path behavior: replies are routed to the tuple address, then delivered locally.
+  - netatalk forwards inbound AURP NBP replies based on the DDP destination (jrouter behavior).
+  - Tuple addresses in replies describe the responder, not the requester.
   - See [netatalk/etc/atalkd/aurp.c](netatalk/etc/atalkd/aurp.c)
 
 2) **DDP source address for FwdReq**
-  - DDP source is set to the router’s address for BrRq→FwdReq encapsulation.
-  - Matches jrouter code path: router appears as DDP source while the tuple reply‑to targets the requester.
+  - DDP source is set to the requester’s address for BrRq→FwdReq encapsulation.
+  - Matches jrouter code path: requester appears as DDP source while the tuple reply‑to targets the requester.
   - See [netatalk/etc/atalkd/nbp.c](netatalk/etc/atalkd/nbp.c)
-
-3) **AURP data acceptance for router‑addressed NBP replies**
-  - netatalk accepts NBP replies addressed to the router and forwards them using the tuple reply‑to address.
-  - This aligns with jrouter’s expectation that replies arrive at the router’s DDP source address.
-  - See [netatalk/etc/atalkd/aurp.c](netatalk/etc/atalkd/aurp.c)
 
 **Remaining**
 
@@ -740,8 +762,8 @@ From [jrouter_startup_capture/aurp_20260114_212351.pcap](jrouter_startup_capture
 ### Bug #18: DDP Source Policy for FwdReq
 
 **Problem**: DDP source selection for forwarded NBP is not specified by RFC 1504  
-**Policy**: Use router's address as DDP source; keep requester in tuple reply‑to  
-**Evidence**: jrouter code uses router address for DDP source; RFC 1504 is silent  
+**Policy**: Use requester’s DDP source for FwdReq; keep requester in tuple reply‑to  
+**Evidence**: jrouter `handleNBPBrRq` copies inbound DDP source into FwdReq; RFC 1504 is silent  
 **Impact**: Interop‑driven; adjust only if peer behavior requires
 
 ### Bug #15: Socket Selection for Forwarding
@@ -1023,3 +1045,13 @@ All specifications in this document have been verified against:
 ---
 
 **End of Document**
+
+---
+
+## Recent Findings (January 24, 2026)
+
+1. **Inbound AURP data limited to FwdReq**: Recent captures show inbound AppleTalk data (`0x0002`) only as NBP `FwdReq`. No `LkUpReply` was observed in inbound AURP data.
+2. **Local EtherTalk capture shows only local traffic**: On the local EtherTalk interface, captures showed only local NBP BrRq and RTMP traffic, with no remote NBP replies observed.
+3. **BaroNet scans return zero**: Targeted `nbp_zone_scan.py` scans for zone “BaroNet” (fwd/lkup, router source, and without overrides) returned zero results.
+4. **`nbplkup` address override constraints**: Attempting to bind non-local source or destination AppleTalk addresses with `-A`/`-D` failed with “Bad address” or “Cannot assign requested address,” indicating only local net/node pairs are accepted for binding.
+5. **Stability note**: The AURP hexdump helper was hardened to avoid buffer overruns that previously caused crashes under inbound data load.

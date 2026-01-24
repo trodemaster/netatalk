@@ -48,27 +48,6 @@
 #include "multicast.h"
 #include "aurp.h"
 
-/*
- * DDP checksum computation (long header).
- * Algorithm: checksum := checksum + next byte; rotate MSB to LSB; repeat.
- * Computation covers bytes after checksum field through end of DDP packet.
- */
-static uint16_t nbp_ddp_checksum(const unsigned char *ddp, int ddp_len)
-{
-    uint16_t sum = 0;
-    int i;
-
-    for (i = 4; i < ddp_len; i++) {
-        sum = (uint16_t)(sum + ddp[i]);
-        sum = (uint16_t)((sum << 1) | (sum >> 15));
-    }
-
-    if (sum == 0) {
-        sum = 0xffff;
-    }
-
-    return sum;
-}
 
 #ifdef __linux__
 static int nbp_send_zone_multicast(struct interface *iface,
@@ -174,6 +153,23 @@ static int nbp_send_zone_multicast(struct interface *iface,
 extern int  transition;
 
 struct nbptab   *nbptab = NULL;
+
+static uint16_t nbp_ddp_checksum(const unsigned char *ddp, int ddp_len)
+{
+    uint16_t sum = 0;
+    int i;
+
+    for (i = 4; i < ddp_len; i++) {
+        sum = (uint16_t)(sum + ddp[i]);
+        sum = (uint16_t)((sum << 1) | (sum >> 15));
+    }
+
+    if (sum == 0) {
+        sum = 0xffff;
+    }
+
+    return sum;
+}
 
 
 static
@@ -678,16 +674,8 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     
                     /*
                      * DDP source policy for AURP‑forwarded NBP:
-                     * - RFC 1504 is silent on DDP source selection for forwarded NBP.
-                     * - Inside Macintosh focuses on NBP tuple reply‑to (which must
-                     *   remain the original requester for return routing), but does
-                     *   not mandate DDP source for tunnel forwarding.
-                     * - jrouter implementation forwards with the original requester's
-                     *   DDP source (see jrouter/router/nbp.go: outDDP SrcNet/SrcNode/SrcSocket
-                     *   taken from incoming packet). This is the behavior we match here.
-                     *
-                     * Alternate policy (router as DDP source) has been tested but is not
-                     * aligned with jrouter behavior; keep tuple reply‑to as requester either way.
+                     * - Keep the tuple reply‑to as the original requester.
+                     * - Use the original requester as the DDP source (matches jrouter).
                      */
                     LOG(log_debug, logtype_atalkd,
                         "DEBUG NBP TUPLE: from %u.%u.%u, tuple says respond to %u.%u.%u",
@@ -767,19 +755,17 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                      * This includes: NBP header (2 bytes) + NBP tuples */
                     memcpy(ddp_packet + pos, nbpop, nbp_data_len);
 
-                    /* Compute DDP checksum over header+payload (long header). */
-                    {
-                        uint16_t cksum = nbp_ddp_checksum(ddp_packet, total_len);
-                        ddp_packet[2] = (cksum >> 8) & 0xFF;
-                        ddp_packet[3] = cksum & 0xFF;
-                    }
-
                     /* DEBUG: Verify DDP packet construction */
                     LOG(log_debug, logtype_atalkd,
                         "DEBUG DDP: pos=%d bytes[0-1]=%02x%02x bytes[12]=%02x total_len=%d",
                         pos, ddp_packet[0], ddp_packet[1], ddp_packet[12], total_len);
 
                     /* Forward through AURP tunnel */
+                    LOG(log_warning, logtype_atalkd,
+                        "nbp brrq: AURP fwd zone '%.*s' to net %u tuple %u.%u.%u",
+                        nn.nn_zonelen, nn.nn_zone, dst_net,
+                        tuple_net, tuple_node, tuple_socket);
+                    aurp_track_nbp_request(nh.nh_id, tuple_net, tuple_node, tuple_socket);
                     if (aurp_send_data(dst_net, (char *)ddp_packet, total_len) < 0) {
                         LOG(log_debug, logtype_atalkd,
                             "nbp brrq: AURP forward to net %u failed", dst_net);
@@ -792,15 +778,30 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
 
                 /* Local route - prefer zone multicast when available */
 #ifdef __linux__
-                if (zt != NULL && zt->zt_bcast != NULL &&
+                if (zt != NULL &&
                     sat.sat_addr.s_net == 0 && sat.sat_addr.s_node == ATADDR_BCAST) {
-                    unsigned char *nbp_payload = (unsigned char *)(data - len) + 1;
-                    int nbp_len = len - 1;
+                    if (zt->zt_bcast == NULL) {
+                        if (zone_bcast(zt) < 0) {
+                            LOG(log_warning, logtype_atalkd,
+                                "nbp_packet: zone_bcast failed for zone %s",
+                                zt->zt_name);
+                        } else if (addmulti(ap->ap_iface->i_name, zt->zt_bcast) < 0) {
+                            LOG(log_warning, logtype_atalkd,
+                                "nbp_packet: addmulti failed for zone %s on %s: %s",
+                                zt->zt_name, ap->ap_iface->i_name,
+                                strerror(errno));
+                        }
+                    }
 
-                    if (nbp_len > 0 &&
-                        nbp_send_zone_multicast(ap->ap_iface, zt->zt_bcast,
-                                                nbp_payload, nbp_len) == 0) {
-                        continue;
+                    if (zt->zt_bcast != NULL) {
+                        unsigned char *nbp_payload = (unsigned char *)(data - len) + 1;
+                        int nbp_len = len - 1;
+
+                        if (nbp_len > 0 &&
+                            nbp_send_zone_multicast(ap->ap_iface, zt->zt_bcast,
+                                                    nbp_payload, nbp_len) == 0) {
+                            continue;
+                        }
                     }
                 }
 #endif

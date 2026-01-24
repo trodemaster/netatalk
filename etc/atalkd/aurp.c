@@ -60,6 +60,80 @@ struct aurp_config aurp_config = {
 /* Global AURP socket file descriptor */
 int aurp_fd = -1;
 
+#define AURP_NBP_TRACK_MAX 256
+#define AURP_NBP_TRACK_TTL 30
+
+struct aurp_nbp_track {
+    uint8_t nbp_id;
+    uint16_t src_net;
+    uint8_t src_node;
+    uint8_t src_socket;
+    time_t ts;
+    int in_use;
+};
+
+static struct aurp_nbp_track aurp_nbp_track[AURP_NBP_TRACK_MAX];
+
+void aurp_track_nbp_request(uint8_t nbp_id, uint16_t src_net,
+                            uint8_t src_node, uint8_t src_socket)
+{
+    int i;
+    time_t now = time(NULL);
+    int slot = -1;
+
+    for (i = 0; i < AURP_NBP_TRACK_MAX; i++) {
+        if (aurp_nbp_track[i].in_use) {
+            if ((now - aurp_nbp_track[i].ts) > AURP_NBP_TRACK_TTL) {
+                aurp_nbp_track[i].in_use = 0;
+            } else if (aurp_nbp_track[i].nbp_id == nbp_id) {
+                slot = i;
+                break;
+            }
+        }
+        if (!aurp_nbp_track[i].in_use && slot == -1) {
+            slot = i;
+        }
+    }
+
+    if (slot >= 0) {
+        aurp_nbp_track[slot].nbp_id = nbp_id;
+        aurp_nbp_track[slot].src_net = src_net;
+        aurp_nbp_track[slot].src_node = src_node;
+        aurp_nbp_track[slot].src_socket = src_socket;
+        aurp_nbp_track[slot].ts = now;
+        aurp_nbp_track[slot].in_use = 1;
+    }
+}
+
+static int aurp_lookup_nbp_request(uint8_t nbp_id, struct sockaddr_at *sat)
+{
+    int i;
+    time_t now = time(NULL);
+
+    for (i = 0; i < AURP_NBP_TRACK_MAX; i++) {
+        if (!aurp_nbp_track[i].in_use) {
+            continue;
+        }
+        if ((now - aurp_nbp_track[i].ts) > AURP_NBP_TRACK_TTL) {
+            aurp_nbp_track[i].in_use = 0;
+            continue;
+        }
+        if (aurp_nbp_track[i].nbp_id == nbp_id) {
+            memset(sat, 0, sizeof(*sat));
+#ifdef BSD4_4
+            sat->sat_len = sizeof(struct sockaddr_at);
+#endif
+            sat->sat_family = AF_APPLETALK;
+            sat->sat_addr.s_net = htons(aurp_nbp_track[i].src_net);
+            sat->sat_addr.s_node = aurp_nbp_track[i].src_node;
+            sat->sat_port = aurp_nbp_track[i].src_socket;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 /*
  * Debug helper: hex dump for packet debugging
  */
@@ -70,21 +144,55 @@ static void aurp_hexdump(const char *prefix, const char *data, int len)
 
     for (i = 0; i < len; i += 16) {
         offset = snprintf(line, sizeof(line), "%s %04x: ", prefix, i);
+        if (offset < 0 || offset >= (int)sizeof(line)) {
+            continue;
+        }
         for (j = 0; j < 16 && (i + j) < len; j++) {
-            offset += snprintf(line + offset, sizeof(line) - offset,
-                              "%02x ", (unsigned char)data[i + j]);
+            int wrote = snprintf(line + offset, sizeof(line) - offset,
+                                 "%02x ", (unsigned char)data[i + j]);
+            if (wrote < 0) {
+                break;
+            }
+            if (wrote >= (int)sizeof(line) - offset) {
+                offset = (int)sizeof(line) - 1;
+                break;
+            }
+            offset += wrote;
         }
         /* Pad if less than 16 bytes */
         for (; j < 16; j++) {
-            offset += snprintf(line + offset, sizeof(line) - offset, "   ");
+            int wrote = snprintf(line + offset, sizeof(line) - offset, "   ");
+            if (wrote < 0) {
+                break;
+            }
+            if (wrote >= (int)sizeof(line) - offset) {
+                offset = (int)sizeof(line) - 1;
+                break;
+            }
+            offset += wrote;
         }
-        offset += snprintf(line + offset, sizeof(line) - offset, " |");
+        if (offset < (int)sizeof(line)) {
+            int wrote = snprintf(line + offset, sizeof(line) - offset, " |");
+            if (wrote > 0 && wrote < (int)sizeof(line) - offset) {
+                offset += wrote;
+            } else {
+                offset = (int)sizeof(line) - 1;
+            }
+        }
         for (j = 0; j < 16 && (i + j) < len; j++) {
             char c = data[i + j];
-            offset += snprintf(line + offset, sizeof(line) - offset, "%c",
-                              (c >= 32 && c < 127) ? c : '.');
+            if (offset >= (int)sizeof(line) - 1) {
+                break;
+            }
+            line[offset++] = (c >= 32 && c < 127) ? c : '.';
+            line[offset] = '\0';
         }
-        snprintf(line + offset, sizeof(line) - offset, "|");
+        if (offset < (int)sizeof(line) - 1) {
+            line[offset++] = '|';
+            line[offset] = '\0';
+        } else {
+            line[sizeof(line) - 1] = '\0';
+        }
         LOG(log_debug9, logtype_atalkd, "%s", line);
     }
 }
@@ -102,6 +210,10 @@ static uint16_t aurp_ddp_checksum(const unsigned char *ddp, int ddp_len)
     for (i = 4; i < ddp_len; i++) {
         sum = (uint16_t)(sum + ddp[i]);
         sum = (uint16_t)((sum << 1) | (sum >> 15));
+    }
+
+    if (sum == 0) {
+        sum = 0xffff;
     }
 
     return sum;
@@ -669,7 +781,6 @@ void aurp_input(int fd)
                 "aurp_input: AppleTalk payload too short (%d)", remaining);
         }
 
-        aurp_hexdump("AURP-DDP", p, remaining > 64 ? 64 : remaining);
         aurp_handle_data(peer, p, remaining);
         return;
     } else if (pkt_type != AURP_PKT_ROUTING) {
@@ -1909,6 +2020,10 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
                     nh.nh_op, nh.nh_cnt, nh.nh_id,
                     ntohs(nt.nt_net), nt.nt_node, nt.nt_port);
 
+                LOG(log_error, logtype_atalkd,
+                    "aurp_handle_data: NBP op=%u dst_socket=%u dst=%u.%u src=%u.%u",
+                    nh.nh_op, dst_socket, dst_net, dst_node, src_net, src_node);
+
                 /* Best-effort parse of NBP strings (object/type/zone) */
                 unsigned char *q = nbp + SZ_NBPHDR + SZ_NBPTUPLE;
                 unsigned char *nbp_end = nbp + nbp_len;
@@ -1993,6 +2108,19 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         if ((iface->i_flags & IFACE_CONFIG) == 0) {
             LOG(log_error, logtype_atalkd,
                 "DEBUG IFACE: %s not configured", iface->i_name);
+            if ((iface->i_flags & IFACE_LOOPBACK) != 0) {
+                continue;
+            }
+            if (iface->i_rt != NULL) {
+                uint16_t firstnet = ntohs(iface->i_rt->rt_firstnet);
+                uint16_t lastnet = ntohs(iface->i_rt->rt_lastnet);
+                if (dst_net >= firstnet && dst_net <= lastnet) {
+                    dest_iface = iface;
+                    LOG(log_error, logtype_atalkd,
+                        "DEBUG IFACE: using %s without IFACE_CONFIG", iface->i_name);
+                    break;
+                }
+            }
             continue;
         }
         if (iface->i_flags & IFACE_LOOPBACK) {
@@ -2029,66 +2157,65 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
     }
 
     /*
-     * If this is an NBP reply, forward it to the reply-to address in the tuple.
-     * Remote peers often send replies to the router's DDP address; the tuple
-     * contains the original requester's address.
+     * jrouter relies on DDP destination routing for NBP replies.
+     * Tuple addresses in replies describe the responder, not the requester.
+     * If a peer sends replies to the router anyway, use the request tracker.
      */
-    if ((uint8_t)data[12] == DDPTYPE_NBP && ddp_len >= 13 + SZ_NBPHDR + SZ_NBPTUPLE) {
+    if ((uint8_t)data[12] == DDPTYPE_NBP && ddp_len >= 13 + SZ_NBPHDR) {
         struct nbphdr nh;
-        struct nbptuple nt;
-        unsigned char *nbp = (unsigned char *)data + 13;
-
-        memcpy(&nh, nbp, SZ_NBPHDR);
-        memcpy(&nt, nbp + SZ_NBPHDR, SZ_NBPTUPLE);
+        memcpy(&nh, data + 13, SZ_NBPHDR);
 
         if (nh.nh_op == NBPOP_LKUPREPLY || nh.nh_op == NBPOP_FWDREPLY) {
-            uint16_t reply_net = ntohs(nt.nt_net);
+            struct sockaddr_at reply_dest;
             struct interface *reply_iface = NULL;
+            uint16_t reply_net;
 
-            for (iface = interfaces; iface != NULL; iface = iface->i_next) {
-                if ((iface->i_flags & IFACE_CONFIG) == 0 || iface->i_rt == NULL) {
-                    continue;
-                }
-                uint16_t firstnet = ntohs(iface->i_rt->rt_firstnet);
-                uint16_t lastnet = ntohs(iface->i_rt->rt_lastnet);
-                if (reply_net >= firstnet && reply_net <= lastnet) {
-                    reply_iface = iface;
-                    break;
-                }
-            }
-
-            if (reply_iface != NULL) {
-                memset(&sat, 0, sizeof(sat));
-#ifdef BSD4_4
-                sat.sat_len = sizeof(struct sockaddr_at);
-#endif
-                sat.sat_family = AF_APPLETALK;
-                sat.sat_addr.s_net = nt.nt_net; /* already network order */
-                sat.sat_addr.s_node = nt.nt_node;
-                sat.sat_port = nt.nt_port;
-
-                for (ap = reply_iface->i_ports; ap != NULL; ap = ap->ap_next) {
-                    if (ap->ap_port == 2) {
+            if (aurp_lookup_nbp_request(nh.nh_id, &reply_dest)) {
+                reply_net = ntohs(reply_dest.sat_addr.s_net);
+                for (iface = interfaces; iface != NULL; iface = iface->i_next) {
+                    if ((iface->i_flags & IFACE_CONFIG) == 0 || iface->i_rt == NULL) {
+                        continue;
+                    }
+                    uint16_t firstnet = ntohs(iface->i_rt->rt_firstnet);
+                    uint16_t lastnet = ntohs(iface->i_rt->rt_lastnet);
+                    if (reply_net >= firstnet && reply_net <= lastnet) {
+                        reply_iface = iface;
                         break;
                     }
                 }
-                if (ap == NULL) {
-                    ap = reply_iface->i_ports;
-                }
 
-                if (ap != NULL) {
-                    if (sendto(ap->ap_fd, data + 12, len - 12, 0,
-                               (struct sockaddr *)&sat, sizeof(sat)) < 0) {
-                        LOG(log_warning, logtype_atalkd,
-                            "aurp_handle_data: reply forward sendto(%u.%u.%u) failed: %s",
-                            reply_net, nt.nt_node, nt.nt_port, strerror(errno));
-                    } else {
-                        LOG(log_debug, logtype_atalkd,
-                            "aurp_handle_data: forwarded NBP reply to %u.%u.%u",
-                            reply_net, nt.nt_node, nt.nt_port);
+                if (reply_iface != NULL) {
+                    for (ap = reply_iface->i_ports; ap != NULL; ap = ap->ap_next) {
+                        if (ap->ap_port == 2) {
+                            break;
+                        }
+                    }
+                    if (ap == NULL) {
+                        ap = reply_iface->i_ports;
+                    }
+
+                    if (ap != NULL) {
+                        LOG(log_error, logtype_atalkd,
+                            "aurp_handle_data: tracked NBP reply using iface=%s port=%u -> %u.%u.%u",
+                            reply_iface->i_name, ap->ap_port,
+                            reply_net, reply_dest.sat_addr.s_node,
+                            reply_dest.sat_port);
+                        if (sendto(ap->ap_fd, data + 12, len - 12, 0,
+                                   (struct sockaddr *)&reply_dest,
+                                   sizeof(reply_dest)) < 0) {
+                            LOG(log_warning, logtype_atalkd,
+                                "aurp_handle_data: tracked reply sendto(%u.%u.%u) failed: %s",
+                                reply_net, reply_dest.sat_addr.s_node,
+                                reply_dest.sat_port, strerror(errno));
+                        } else {
+                            LOG(log_debug, logtype_atalkd,
+                                "aurp_handle_data: forwarded tracked NBP reply to %u.%u.%u",
+                                reply_net, reply_dest.sat_addr.s_node,
+                                reply_dest.sat_port);
+                        }
+                        return;
                     }
                 }
-                return;
             }
         }
     }
@@ -2145,6 +2272,12 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
                     unsigned char lookup_len = zone_len;
 
                     if (lookup_len == 1 && *lookup_name == '*') {
+                        if (dest_iface->i_rt != NULL && dest_iface->i_rt->rt_zt != NULL) {
+                            zt = (struct ziptab *)dest_iface->i_rt->rt_zt->l_data;
+                            lookup_name = (unsigned char *)zt->zt_name;
+                            lookup_len = zt->zt_len;
+                        }
+                    } else if (lookup_len == 0) {
                         if (dest_iface->i_rt != NULL && dest_iface->i_rt->rt_zt != NULL) {
                             zt = (struct ziptab *)dest_iface->i_rt->rt_zt->l_data;
                             lookup_name = (unsigned char *)zt->zt_name;
@@ -2209,6 +2342,9 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
             }
 
             if (ap != NULL) {
+                LOG(log_error, logtype_atalkd,
+                    "aurp_handle_data: broadcast FwdReq as LkUp iface=%s port=%u -> %u.%u.%u",
+                    dest_iface->i_name, ap->ap_port, 0, ATADDR_BCAST, 2);
                 if (sendto(ap->ap_fd, data + 12, len - 12, 0,
                            (struct sockaddr *)&sat, sizeof(sat)) < 0) {
                     LOG(log_warning, logtype_atalkd,
@@ -2353,6 +2489,9 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
                 }
             }
             if (ap == NULL) {
+                LOG(log_error, logtype_atalkd,
+                    "aurp_handle_data: broadcast any-router NBP iface=%s port=%u -> %u.%u.%u",
+                    dest_iface->i_name, ap->ap_port, 0, ATADDR_BCAST, 2);
                 ap = dest_iface->i_ports;  /* Use first available port */
             }
             
@@ -2384,21 +2523,32 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
     sat.sat_addr.s_node = dst_node;
     sat.sat_port = dst_socket;
 
-    /* Find the appropriate port to send from
-     * For NBP packets (socket 2), use the NBP port
-     * For other packets, use a matching port or RTMP port */
-    for (ap = dest_iface->i_ports; ap != NULL; ap = ap->ap_next) {
-        /* Prefer matching the destination socket (especially for NBP socket 2) */
-        if (ap->ap_port == dst_socket) {
-            break;
-        }
-    }
-    
-    /* Fallback to RTMP port if no exact match */
-    if (ap == NULL) {
+    /* Find the appropriate port to send from.
+     * For NBP packets, always send from socket 2 (NBP), regardless of the
+     * destination socket (which may be the requester's socket).
+     * For other packets, use a matching port or RTMP port. */
+    if ((uint8_t)data[12] == DDPTYPE_NBP) {
         for (ap = dest_iface->i_ports; ap != NULL; ap = ap->ap_next) {
-            if (ap->ap_port == 1) {  /* RTMP port */
+            if (ap->ap_port == 2) {  /* NBP port */
                 break;
+            }
+        }
+        if (ap == NULL) {
+            ap = dest_iface->i_ports;
+        }
+    } else {
+        for (ap = dest_iface->i_ports; ap != NULL; ap = ap->ap_next) {
+            if (ap->ap_port == dst_socket) {
+                break;
+            }
+        }
+
+        /* Fallback to RTMP port if no exact match */
+        if (ap == NULL) {
+            for (ap = dest_iface->i_ports; ap != NULL; ap = ap->ap_next) {
+                if (ap->ap_port == 1) {  /* RTMP port */
+                    break;
+                }
             }
         }
     }
@@ -2422,6 +2572,11 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         LOG(log_error, logtype_atalkd,
             "*** aurp_handle_data: forwarded packet to %u.%u.%u (via socket %d) ***",
             dst_net, dst_node, dst_socket, ap->ap_port);
+        if ((uint8_t)data[12] == DDPTYPE_NBP) {
+            LOG(log_error, logtype_atalkd,
+                "aurp_handle_data: NBP forward iface=%s port=%u -> %u.%u.%u",
+                dest_iface->i_name, ap->ap_port, dst_net, dst_node, dst_socket);
+        }
     }
 }
 
@@ -2467,6 +2622,27 @@ int aurp_send_data(uint16_t dst_net, char *ddp_data, int ddp_len)
     /* Copy DDP packet data */
     memcpy(buf + len, ddp_data, ddp_len);
     len += ddp_len;
+
+    /* Log key DDP header fields for AURP data sends */
+    if (ddp_len >= 13) {
+        unsigned char *p = (unsigned char *)ddp_data;
+        uint16_t hop_len = (p[0] << 8) | p[1];
+        uint16_t checksum = (p[2] << 8) | p[3];
+        uint16_t dst_net = (p[4] << 8) | p[5];
+        uint8_t dst_node = p[6];
+        uint8_t dst_socket = p[7];
+        uint16_t src_net = (p[8] << 8) | p[9];
+        uint8_t src_node = p[10];
+        uint8_t src_socket = p[11];
+        uint8_t ddp_type = p[12];
+
+        LOG(log_warning, logtype_atalkd,
+            "aurp_send_data: peer %s DDP %u.%u.%u -> %u.%u.%u type=0x%02x len=%u cksum=0x%04x",
+            peer ? inet_ntoa(peer->ap_addr) : "?",
+            src_net, src_node, src_socket,
+            dst_net, dst_node, dst_socket,
+            ddp_type, hop_len & 0x3FF, checksum);
+    }
 
     /* DEBUG: Log packet hex for analysis */
     {

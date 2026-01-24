@@ -217,6 +217,9 @@ int aurp_send_rd(struct aurp_peer *peer, int16_t error);
 int aurp_send_tickle(struct aurp_peer *peer);
 int aurp_send_tickle_ack(struct aurp_peer *peer);
 
+void aurp_track_nbp_request(uint8_t nbp_id, uint16_t src_net,
+                            uint8_t src_node, uint8_t src_socket);
+
 /* Raw EtherTalk capture for local->AURP forwarding (Linux only) */
 int aurp_raw_init(void);
 void aurp_raw_input(int fd);
