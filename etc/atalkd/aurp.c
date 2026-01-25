@@ -1915,8 +1915,9 @@ struct aurp_peer *aurp_find_peer_for_net(uint16_t net)
     for (peer = aurp_config.ac_peers; peer != NULL; peer = peer->ap_next) {
         peer_count++;
         
-        /* Only consider connected peers */
-        if (peer->ap_recv_state != AURP_RECV_CONNECTED) {
+        /* Only consider connected peers (CONNECTED or WAIT_TICKLE_ACK) */
+        if (peer->ap_recv_state != AURP_RECV_CONNECTED && 
+            peer->ap_recv_state != AURP_RECV_WAIT_TICKLE_ACK) {
             LOG(log_error, logtype_atalkd,
                 "DEBUG PEER FIND: Peer %s not connected (state=%d)",
                 inet_ntoa(peer->ap_addr), peer->ap_recv_state);
