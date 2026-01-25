@@ -1080,13 +1080,33 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
          * (the router) because we used our address as the DDP source in the FwdReq.
          * 
          * We need to forward this reply to the original requester (the Mac).
-         * The original requester's address is in the NBP tuple's reply-to field.
+         * The original requester's address was stored when we forwarded the request.
          */
-        LOG(log_debug, logtype_atalkd,
+        LOG(log_warning, logtype_atalkd,
             "nbp_packet: NBP reply received (op=%u) from %u.%u.%u id=%u count=%u len=%d",
             nh.nh_op,
             ntohs(from->sat_addr.s_net), from->sat_addr.s_node, from->sat_port,
             nh.nh_id, nh.nh_cnt, len);
+        
+        /* Look up the original requester using the NBP ID */
+        struct sockaddr_at requester;
+        if (aurp_lookup_nbp_request(nh.nh_id, &requester) == 0) {
+            LOG(log_warning, logtype_atalkd,
+                "nbp_packet: forwarding reply id=%u to original requester %u.%u:%u",
+                nh.nh_id,
+                ntohs(requester.sat_addr.s_net), requester.sat_addr.s_node, requester.sat_port);
+            
+            /* Forward the reply to the original requester */
+            if (sendto(ap->ap_fd, nbpop, len, 0,
+                       (struct sockaddr *)&requester, sizeof(requester)) < 0) {
+                LOG(log_error, logtype_atalkd,
+                    "nbp_packet: sendto reply failed: %s", strerror(errno));
+            }
+        } else {
+            LOG(log_warning, logtype_atalkd,
+                "nbp_packet: no tracked request found for NBP ID %u (reply dropped)",
+                nh.nh_id);
+        }
         break;
 
     default :

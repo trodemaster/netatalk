@@ -105,7 +105,7 @@ void aurp_track_nbp_request(uint8_t nbp_id, uint16_t src_net,
     }
 }
 
-static int aurp_lookup_nbp_request(uint8_t nbp_id, struct sockaddr_at *sat)
+int aurp_lookup_nbp_request(uint8_t nbp_id, struct sockaddr_at *sat)
 {
     int i;
     time_t now = time(NULL);
