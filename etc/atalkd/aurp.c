@@ -667,8 +667,8 @@ void aurp_input(int fd)
         return;
     }
 
-    LOG(log_debug, logtype_atalkd,
-        "aurp_input: received %zd bytes from %s:%d",
+    LOG(log_error, logtype_atalkd,
+        "*** AURP PACKET RECEIVED: %zd bytes from %s:%d ***",
         len, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
     aurp_hexdump("RECV", buf, len);
 
@@ -724,6 +724,14 @@ void aurp_input(int fd)
     pkt_type = ntohs(pkt_type);
     p += 6;
     remaining -= 6;
+
+    LOG(log_error, logtype_atalkd,
+        "aurp_input: parsed domain header: version=0x%04x reserved=0x%04x pkt_type=0x%04x remaining=%d",
+        version, reserved, pkt_type, remaining);
+
+    LOG(log_error, logtype_atalkd,
+        "aurp_input: parsed domain header: version=0x%04x reserved=0x%04x pkt_type=0x%04x remaining=%d",
+        version, reserved, pkt_type, remaining);
 
     /* Verify version */
     if (version != AURP_VERSION) {
