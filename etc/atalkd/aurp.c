@@ -1006,8 +1006,9 @@ int aurp_send_ri_req(struct aurp_peer *peer)
     int n;
 
     /* Build routing header (domain + transport + command) */
+    /* Request zone information along with routing info */
     n = aurp_build_routing_header(buf, sizeof(buf), peer, peer->ap_local_conn_id,
-                                   0, AURP_CMD_RI_REQ, AURP_FLAG_SUI_ALL);
+                                   0, AURP_CMD_RI_REQ, AURP_FLAG_SUI_ALL | AURP_FLAG_SZI);
     if (n < 0) return -1;
     len += n;
 

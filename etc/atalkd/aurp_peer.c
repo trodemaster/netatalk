@@ -873,8 +873,9 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
 /* Handle RI-Ack */
 void aurp_handle_ri_ack(struct aurp_peer *peer, char *data, int len)
 {
-    LOG(log_debug, logtype_atalkd, "aurp_handle_ri_ack: from %s flags=0x%04x",
-        inet_ntoa(peer->ap_addr), peer->ap_last_recv_flags);
+    LOG(log_error, logtype_atalkd, "aurp_handle_ri_ack: from %s flags=0x%04x SZI=%d",
+        inet_ntoa(peer->ap_addr), peer->ap_last_recv_flags,
+        !!(peer->ap_last_recv_flags & AURP_FLAG_SZI));
 
     /* Clear pending retransmission */
     if (peer->ap_last_pkt) {
