@@ -1116,17 +1116,25 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
     len += n;
 
     /* Build network tuples from our local interfaces */
+    int iface_count = 0, skipped_unconfig = 0, skipped_loopback = 0, added_count = 0;
     for (iface = interfaces; iface != NULL; iface = iface->i_next) {
         uint16_t firstnet, lastnet;
         uint8_t dist;
+        
+        iface_count++;
 
         /* Skip unconfigured interfaces */
         if ((iface->i_flags & IFACE_CONFIG) == 0) {
+            skipped_unconfig++;
+            LOG(log_error, logtype_atalkd,
+                "aurp_send_ri_rsp: skipping unconfigured interface (flags=0x%x)",
+                iface->i_flags);
             continue;
         }
 
         /* Skip loopback */
         if (iface->i_flags & IFACE_LOOPBACK) {
+            skipped_loopback++;
             continue;
         }
 
@@ -1159,10 +1167,15 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
             buf[len++] = 0x00;  /* Reserved */
         }
 
-        LOG(log_debug, logtype_atalkd,
+        LOG(log_error, logtype_atalkd,
             "aurp_send_ri_rsp: adding network %u-%u dist %u",
             firstnet, lastnet, dist);
+        added_count++;
     }
+    
+    LOG(log_error, logtype_atalkd,
+        "aurp_send_ri_rsp: checked %d interfaces, skipped %d unconfig, %d loopback, added %d networks",
+        iface_count, skipped_unconfig, skipped_loopback, added_count);
 
     /* Send packet */
     if (aurp_send_packet(peer, buf, len) < 0) {
@@ -2174,13 +2187,25 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         struct nbphdr nh;
         memcpy(&nh, data + 13, SZ_NBPHDR);
 
+        LOG(log_error, logtype_atalkd,
+            "aurp_handle_data: NBP packet received! op=%u id=%u count=%u",
+            nh.nh_op, nh.nh_id, nh.nh_cnt);
+
         if (nh.nh_op == NBPOP_LKUPREPLY || nh.nh_op == NBPOP_FWDREPLY) {
             struct sockaddr_at reply_dest;
             struct interface *reply_iface = NULL;
             uint16_t reply_net;
 
+            LOG(log_error, logtype_atalkd,
+                "aurp_handle_data: Got NBP REPLY (op=%u)! Looking up tracked request for id=%u",
+                nh.nh_op, nh.nh_id);
+
             if (aurp_lookup_nbp_request(nh.nh_id, &reply_dest)) {
                 reply_net = ntohs(reply_dest.sat_addr.s_net);
+                
+                LOG(log_error, logtype_atalkd,
+                    "aurp_handle_data: Found tracked request! Reply should go to %u.%u.%u",
+                    reply_net, reply_dest.sat_addr.s_node, reply_dest.sat_port);
                 for (iface = interfaces; iface != NULL; iface = iface->i_next) {
                     if ((iface->i_flags & IFACE_CONFIG) == 0 || iface->i_rt == NULL) {
                         continue;
@@ -2608,11 +2633,11 @@ int aurp_send_data(uint16_t dst_net, char *ddp_data, int ddp_len)
         return -1;
     }
 
-    /* Only send if peer is connected */
-    if (peer->ap_recv_state != AURP_RECV_CONNECTED) {
+    /* Only send if peer's send channel is connected */
+    if (peer->ap_send_state != AURP_SEND_CONNECTED) {
         LOG(log_warning, logtype_atalkd,
-            "aurp_send_data: peer %s (net %u) not connected (state=%d)",
-            inet_ntoa(peer->ap_addr), dst_net, peer->ap_recv_state);
+            "aurp_send_data: peer %s (net %u) send channel not connected (send_state=%d)",
+            inet_ntoa(peer->ap_addr), dst_net, peer->ap_send_state);
         return -1;
     }
 

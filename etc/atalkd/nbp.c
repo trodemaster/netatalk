@@ -850,7 +850,91 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
             return 0;
         }
 
-        /* search our data */
+        /* Check if this is a query for a remote zone - if so, forward via AURP */
+        if (nn.nn_zonelen > 0 && !(nn.nn_zonelen == 1 && *nn.nn_zone == '*')) {
+            /* Look up the zone in our zone table */
+            for (zt = ziptab; zt; zt = zt->zt_next) {
+                if (zt->zt_len == nn.nn_zonelen && 
+                    strndiacasecmp(zt->zt_name, nn.nn_zone, zt->zt_len) == 0) {
+                    break;
+                }
+            }
+
+            if (zt != NULL) {
+                /* Check if any of the zone's routes are AURP routes */
+                for (l = zt->zt_rt; l; l = l->l_next) {
+                    rtmp = (struct rtmptab *)l->l_data;
+                    
+                    if (rtmp->rt_flags & RTMPTAB_AURP) {
+                        /* This is a remote zone via AURP - forward the request */
+                        unsigned char ddp_packet[ATP_BUFSIZ];
+                        uint16_t dst_net = ntohs(rtmp->rt_firstnet);
+                        uint16_t src_net = ntohs(from->sat_addr.s_net);
+                        
+                        int nbp_data_len = end - nbpop;
+                        uint16_t total_len = 13 + nbp_data_len;
+                        
+                        /* Parse NBP tuple address (after 2-byte NBP header) */
+                        unsigned char *tuple_start = (unsigned char *)(nbpop + 2);
+                        uint16_t tuple_net = (tuple_start[0] << 8) | tuple_start[1];
+                        uint8_t tuple_node = tuple_start[2];
+                        uint8_t tuple_socket = tuple_start[3];
+                        
+                        uint16_t src_net_host = src_net;
+                        uint8_t src_node = from->sat_addr.s_node;
+                        uint8_t src_socket = from->sat_port;
+                        
+                        if (dst_net == 0 || total_len > sizeof(ddp_packet)) {
+                            continue;
+                        }
+                        
+                        /* Build extended DDP header */
+                        int pos = 0;
+                        uint16_t hop_len = (0 << 10) | (total_len & 0x3FF);
+                        ddp_packet[pos++] = (hop_len >> 8) & 0xFF;
+                        ddp_packet[pos++] = hop_len & 0xFF;
+                        ddp_packet[pos++] = 0x00;  /* Checksum */
+                        ddp_packet[pos++] = 0x00;
+                        ddp_packet[pos++] = (dst_net >> 8) & 0xFF;
+                        ddp_packet[pos++] = dst_net & 0xFF;
+                        ddp_packet[pos++] = 0;     /* Router node */
+                        ddp_packet[pos++] = 2;     /* NBP socket */
+                        ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;
+                        ddp_packet[pos++] = src_net_host & 0xFF;
+                        ddp_packet[pos++] = src_node;
+                        ddp_packet[pos++] = src_socket;
+                        ddp_packet[pos++] = DDPTYPE_NBP;
+                        
+                        /* Convert LkUp to FwdReq */
+                        struct nbphdr nh_fwd;
+                        memcpy(&nh_fwd, nbpop, SZ_NBPHDR);
+                        nh_fwd.nh_op = NBPOP_FWD;
+                        memcpy(ddp_packet + pos, &nh_fwd, SZ_NBPHDR);
+                        pos += SZ_NBPHDR;
+                        
+                        /* Copy rest of NBP data (tuples) */
+                        memcpy(ddp_packet + pos, nbpop + SZ_NBPHDR, nbp_data_len - SZ_NBPHDR);
+                        
+                        /* Forward through AURP tunnel */
+                        LOG(log_warning, logtype_atalkd,
+                            "nbp lkup: AURP fwd zone '%.*s' to net %u from %u.%u.%u (id=%u)",
+                            nn.nn_zonelen, nn.nn_zone, dst_net,
+                            src_net_host, src_node, src_socket, nh.nh_id);
+                        aurp_track_nbp_request(nh.nh_id, tuple_net, tuple_node, tuple_socket);
+                        if (aurp_send_data(dst_net, (char *)ddp_packet, total_len) < 0) {
+                            LOG(log_debug, logtype_atalkd,
+                                "nbp lkup: AURP forward to net %u failed", dst_net);
+                        } else {
+                            LOG(log_warning, logtype_atalkd,
+                                "nbp lkup: sent FwdReq to net %u (tracked id=%u)", dst_net, nh.nh_id);
+                        }
+                        /* Continue to check other routes for this zone */
+                    }
+                }
+            }
+        }
+
+        /* search our local data */
         n = i = 0;
         data = packet + 1 + SZ_NBPHDR;
         end = packet + sizeof(packet);
