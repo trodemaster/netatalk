@@ -2870,3 +2870,152 @@ Hypothesis:
 - Need to capture and compare packet flow during mount attempt
 
 ---
+
+## Bug #15 Investigation - Missing ATP Traffic & AURP Connection Instability (January 26, 2026)
+
+### Packet Capture Comparison Results
+
+Executed `tools/compare_afp_mount.sh` to capture AURP traffic during AFP mount attempts with both netatalk and jrouter.
+
+**Critical Findings**:
+
+### 1. Missing ATP (AppleTalk Transaction Protocol) Traffic
+
+**Protocol Overview**:
+- **ATP** (DDP type 0x03): Reliable transaction protocol used by AFP/ASP
+- Required for AFP file sharing sessions
+- Handles request/response with retry and acknowledgment
+
+**Traffic Comparison**:
+
+| Implementation | Inbound ATP | Outbound ATP | Total ATP |
+|----------------|-------------|--------------|-----------|
+| **jrouter**    | 158 packets | 306 packets  | **464**   |
+| **netatalk**   | **0 packets** | **0 packets** | **0**     |
+
+**Affected Peer**: Primary ATP traffic from peer 97.88.69.164 (sent 158 ATP packets to jrouter, **0 to netatalk**)
+
+### 2. Excessive AURP Open-Req Retries
+
+**Connection Establishment Comparison**:
+
+| Implementation | Open-Req Sent | Normal Behavior |
+|----------------|---------------|-----------------|
+| **jrouter**    | 10 packets    | ✅ Normal       |
+| **netatalk**   | **1,339 packets** | ❌ **EXCESSIVE** |
+
+**Analysis**: Netatalk sent **134x more** Open-Req packets than jrouter, indicating:
+- AURP connections not staying established
+- Peers may be rejecting or ignoring Open-Req
+- Connection state machine may be stuck in retry loop
+- Prevents stable data channel for ATP traffic
+
+### 3. Total Packet Volume Disparity
+
+**From Key Peer (97.88.69.164)**:
+
+| Implementation | Packets Received | Packets Sent |
+|----------------|------------------|--------------|
+| **jrouter**    | 206 packets      | 389 packets  |
+| **netatalk**   | 26 packets       | 26 packets   |
+
+**Interpretation**: Remote peer is **sending 7.9x less traffic** to netatalk, suggesting:
+- Peer doesn't consider netatalk connection fully established
+- Peer won't send data (ATP) over unstable connections
+- Open-Req spam may be triggering peer-side filtering/throttling
+
+### 4. Detailed Traffic Breakdown
+
+**netatalk capture (90 seconds during mount attempt)**:
+```
+in_type0002:  26 (AppleTalk Data packets)
+out_type0002: 18
+in_type0003:  494 (Routing packets)
+out_type0003: 1811 (includes 1339 Open-Req!)
+
+Inbound DDP types:
+  0x02 NBP:     26 packets (LkUpReply:18, FwdReq:8)
+
+Outbound DDP types:
+  0x02 NBP:     18 packets (all FwdReq)
+```
+
+**jrouter capture (75 seconds during mount attempt)**:
+```
+in_type0002:  209 (AppleTalk Data packets)
+out_type0002: 397
+in_type0003:  113 (Routing packets)
+out_type0003: 118 (normal volume)
+
+Inbound DDP types:
+  0x03 ATP:     158 packets  ← AFP protocol traffic
+  0x02 NBP:     50 packets (LkUpReply:50)
+  0x04 ZIP:     1 packet
+
+Outbound DDP types:
+  0x03 ATP:     306 packets  ← AFP protocol traffic
+  0x02 NBP:     90 packets (FwdReq:90)
+  0x04 ZIP:     1 packet
+```
+
+### Root Cause Analysis
+
+**Primary Issue**: AURP connection instability prevents ATP traffic
+
+1. **Connection State Problem**:
+   - Peers receive our Open-Req but something prevents proper handshake completion
+   - Possible causes:
+     - Open-Req packet format issue
+     - Connection ID conflict
+     - Sequence number handling
+     - Flags/options mismatch
+
+2. **Peer Behavior**:
+   - Peers accept routing info (RI-Rsp, ZI-Rsp) - seen in captures
+   - Peers respond to our Tickle packets - bidirectional confirmed
+   - But peers **won't send AppleTalk Data (type 0x0002)** to us
+   - This suggests send channel (peer→us) not fully established
+
+3. **Impact Chain**:
+   ```
+   Unstable AURP → No ATP forwarding → AFP can't establish session → Mount fails
+   ```
+
+### Next Debugging Steps
+
+1. **Analyze Open-Req packet format**:
+   - Compare netatalk vs jrouter Open-Req packets byte-by-byte
+   - Check Connection ID, sequence numbers, flags
+   - Verify domain identifier format
+
+2. **Check peer state tracking**:
+   - Review `ap_send_state` and `ap_recv_state` values
+   - Verify state transitions in Open-Req/Open-Rsp handlers
+   - Check if Bug #13 fix is actually working
+
+3. **Monitor connection lifecycle**:
+   - Add detailed logging for Open-Req→Open-Rsp→Connected transitions
+   - Track why peers aren't responding to our Open-Req
+   - Check if peers are sending Router-Down or errors
+
+4. **Test with specific peer**:
+   - Focus on peer 97.88.69.164 (known to send ATP with jrouter)
+   - Capture full handshake sequence
+   - Compare state machine progression
+
+### Files to Investigate
+
+- **`etc/atalkd/aurp_peer.c`**: Open-Req/Open-Rsp handlers, state machine
+- **`etc/atalkd/aurp.c`**: `aurp_build_open_req()`, packet construction
+- **`etc/atalkd/aurp_peer.c`**: `aurp_handle_open_req()`, `aurp_handle_open_rsp()`
+- **`etc/atalkd/aurp.c`**: `aurp_handle_data()` - ATP forwarding (should work once connections stable)
+
+### Expected Behavior After Fix
+
+Once AURP connections are stable:
+- Open-Req count should match jrouter (~10 for initial handshakes)
+- Peers should send ATP traffic (type 0x0002, DDP type 0x03)
+- AFP mount attempts should complete successfully
+- `aurp_handle_data()` will forward ATP packets to local Mac (code already correct)
+
+---
