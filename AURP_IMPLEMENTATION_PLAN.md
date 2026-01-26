@@ -795,12 +795,14 @@ aurp-peer 10.0.0.1            # Another peer
    - Fix: Changed to `int nbp_data_len = end - nbpop`
    - Impact: Full NBP tuples now included in forwarded packets
 
-**Current Status (January 15, 2026 - Updated)**:
+**Current Status (January 26, 2026 - Updated)**:
 - ✅ **Inbound (AURP → Local)**: Working - `aurp_handle_data()` receives AURP data packets and forwards to local network
-- ✅ **Outbound (Local → AURP)**: IMPLEMENTED - NBP forwarding code added to `nbp.c` (lines 505-554)
+- ✅ **Outbound (Local → AURP)**: WORKING - NBP forwarding code in `nbp.c` verified correct
 - ✅ **Compilation**: Fixed struct includes, code compiles and runs
-- ✅ **Service Status**: 9 peers connected, 11 routes, 10 zones discovered
-- ⏳ **Testing Needed**: Actual cross-zone NBP lookups from vintage Mac required to verify data forwarding
+- ✅ **Service Status**: 70+ peers connected, 100+ routes, 11 zones discovered
+- ✅ **NBP Lookups**: Working! Remote zone lookups return results (16 AFP servers found)
+- ✅ **Mac Chooser**: Zones visible, server names visible in remote zones!
+- ⚠️ **AFP Mounting**: Not yet working - next bug to investigate
 
 **Implementation Plan for Outbound Forwarding**:
 
@@ -808,6 +810,7 @@ The issue is in `nbp.c` around line 503 where NBP broadcasts are sent to remote 
 ```c
 if (sendto(ap->ap_fd, data - len, len, 0,
            (struct sockaddr *)&sat,
+
            sizeof(struct sockaddr_at)) < 0) {
     ...
 }
@@ -1096,9 +1099,14 @@ To resume this implementation effort:
 7. [x] Phase 4 Complete: Route exchange (RI-Req/RI-Rsp/RI-Upd/RI-Ack/RD)
 8. [x] Phase 5 Complete: Zone information exchange (ZI-Req/ZI-Rsp)
 9. [x] Phase 6 Complete: Data forwarding (DDP encapsulation)
-10. [ ] Phase 7 Pending: Testing and polish
+10. [x] Phase 7 In Progress: Testing and polish (18 bugs fixed, NBP working, AFP mounting next)
 
-**Current Status**: AURP service with full route exchange, zone information, and data forwarding. Ready for Phase 7 (testing and polish).
+**Current Status (January 26, 2026)**: 
+- ✅ AURP tunnel connections working (70+ peers)
+- ✅ Route/zone exchange working (100+ routes, 11 zones)
+- ✅ NBP lookups to remote zones working (Bug #14 fix)
+- ✅ Mac Chooser sees zones and server names!
+- ⚠️ **Next**: Debug why AFP share mounting fails (works with jrouter)
 
 ---
 
@@ -1993,17 +2001,19 @@ The NBP packet format is verified correct. The lack of observed responses may be
 | 10 | DDP source for AURP FwdReq | ⚠️ Reverted | Initially changed to router address, then reverted (see Bug #13, #18) |
 | 11 | Destination Domain Identifier | ✅ Fixed | Use peer's advertised DI (ap_remote_di), not public IP |
 | **12** | **Missing NBPOP_LKUPREPLY Handler** | ✅ Fixed | **Add handler to forward incoming NBP Lookup Replies to local network** |
-| **13** | **DDP Source Address Revert** | ✅ Fixed | **Reverted Bug #10 - Use ORIGINAL Mac requester's address (per jrouter code analysis)** |
-| 14 | Source Network Byte Order (first attempt) | ✅ Fixed | Initial fix for byte order issue |
+| **13** | **Send State Not Set in Open-Rsp** | ✅ Fixed | **Add `ap_send_state = AURP_SEND_CONNECTED` in aurp_handle_open_rsp()** |
+| **14** | **DDP Extended Header Byte Order** | ✅ Fixed | **MAJOR: Bytes 6-7 must be src_net, not dst_node/dst_sock. Fixed in nbp.c (3 places) and aurp.c (2 places)** |
 | **15** | **Socket Selection for Forwarding** | ✅ Fixed | **Match destination socket (especially NBP socket 2) when forwarding incoming DDP** |
 | 16 | Source Network Byte Copy | ✅ Fixed | Direct byte copy fix |
 | 17 | Source Network Endianness | ✅ Fixed | Use ntohs() to convert to host order, then extract bytes |
 | **18** | **DDP Source Should Be Router's Address** | ✅ Fixed | **Use router's interface address as DDP source (per jrouter packet captures)** |
 
+**Note on Bug #14**: This was the critical breakthrough that made NBP lookups work. The DDP extended header had bytes 6-7 assigned to dst_node/dst_sock instead of src_net, shifting all subsequent fields by 2 bytes. Packet captures showed netatalk sending src_net=2 vs jrouter's correct src_net=650.
+
 **Note on Bug #10/#13/#18**: There was confusion about whether to use router's or Mac's address. Final resolution (Bug #18): Use **router's address** as DDP source, matching jrouter's actual packet behavior. The NBP tuple reply-to field contains the Mac's address for forwarding.
 
 **Total Bugs Fixed**: 18  
-**Critical Bugs**: #12 (missing handler), #15 (socket selection), #18 (DDP source address)
+**Critical Bugs**: #12 (missing handler), #14 (DDP header byte order - BREAKTHROUGH), #15 (socket selection), #18 (DDP source address)
 
 ---
 
@@ -2727,5 +2737,136 @@ Despite fixing Bug #13, Mac Chooser still shows ZERO remote AFP servers (jrouter
 3. Check if replies are being sent but to wrong address
 4. Verify NBP request tracking (`aurp_nbp_track`) is working
 5. Add more detailed logging to `aurp_handle_data` NBP reply path
+
+---
+## Bug #14 Fix - DDP Extended Header Byte Order (January 26, 2026 - MAJOR BREAKTHROUGH)
+
+### Bug #14: DDP Extended Header Construction Was Completely Wrong
+
+**Problem**: NBP lookups to remote AURP zones never returned results. Packet captures showed netatalk sending `src_net=2` instead of `src_net=650`, and all subsequent DDP header fields were shifted by 2 bytes.
+
+**Root Cause**: The DDP extended header construction in `nbp.c` had the wrong byte order. The code was placing `dst_node` and `dst_port` at bytes 6-7, when bytes 6-7 should be `src_net`:
+
+**Wrong (before fix)**:
+```c
+/* Bytes 6-7 were being used for dst_node and dst_port! */
+ddp_packet[pos++] = dst_node;    // WRONG - byte 6
+ddp_packet[pos++] = dst_sock;    // WRONG - byte 7  
+/* Then src_net, src_node, src_sock all shifted down 2 bytes */
+```
+
+**Correct DDP Extended Header format (13 bytes)**:
+```
+Byte 0-1:  Hop count (4 bits) + Length (10 bits) - big-endian
+Byte 2-3:  Checksum (0x0000 for no checksum)
+Byte 4-5:  Destination Network - big-endian
+Byte 6-7:  Source Network - big-endian      ← THIS WAS WRONG!
+Byte 8:    Destination Node
+Byte 9:    Source Node
+Byte 10:   Destination Socket
+Byte 11:   Source Socket
+Byte 12:   DDP Type
+```
+
+**Packet Capture Evidence**:
+```
+jrouter (CORRECT):   src=650.73 → dst=19680.0 (bytes: 02 8A 00 49...)
+netatalk (BROKEN):   src=2.2   → dst=19680.2 (bytes: 00 02 02 00...)
+```
+
+The jrouter packet showed `02 8A` = 650 for source network, while netatalk was sending `00 02` = 2.
+
+**Files Fixed**:
+
+1. **`/home/blake/code/netatalk/etc/atalkd/nbp.c`** - Three locations:
+   - Line ~100: Zone multicast path
+   - Line ~750: BrRq AURP forwarding path
+   - Line ~920: LkUp AURP forwarding path
+
+2. **`/home/blake/code/netatalk/etc/atalkd/aurp.c`** - Two locations:
+   - Line ~790: Logging/debug DDP parsing
+   - Line ~2000: `aurp_handle_data()` DDP header parsing
+
+**Correct DDP Header Construction**:
+```c
+/* DDP Extended Header - 13 bytes total */
+int pos = 0;
+
+/* Bytes 0-1: Hop count (0) + Length */
+uint16_t hop_len = (0 << 10) | (ddp_len & 0x3FF);
+ddp_packet[pos++] = (hop_len >> 8) & 0xFF;
+ddp_packet[pos++] = hop_len & 0xFF;
+
+/* Bytes 2-3: Checksum (0 = no checksum) */
+ddp_packet[pos++] = 0x00;
+ddp_packet[pos++] = 0x00;
+
+/* Bytes 4-5: Destination Network (big-endian) */
+ddp_packet[pos++] = (dst_net >> 8) & 0xFF;
+ddp_packet[pos++] = dst_net & 0xFF;
+
+/* Bytes 6-7: Source Network (big-endian) */
+ddp_packet[pos++] = (src_net >> 8) & 0xFF;
+ddp_packet[pos++] = src_net & 0xFF;
+
+/* Byte 8: Destination Node */
+ddp_packet[pos++] = dst_node;
+
+/* Byte 9: Source Node */
+ddp_packet[pos++] = src_node;
+
+/* Byte 10: Destination Socket */
+ddp_packet[pos++] = dst_sock;
+
+/* Byte 11: Source Socket */
+ddp_packet[pos++] = src_sock;
+
+/* Byte 12: DDP Type */
+ddp_packet[pos++] = ddp_type;
+```
+
+### Result: NBP Lookups Now Work!
+
+**Verification**:
+```bash
+$ nbplkup "=:AFPServer@Airaga"
+     AIR Admin's Guide Server:AFPServer    19680.50:250
+
+$ python3 tools/nbp_zone_scan.py --type AFPServer
+Scanning 11 zones for AFPServer...
+=== Zone: Airaga ===
+  AIR Admin's Guide Server:AFPServer    19680.50:250
+=== Zone: CiderPress ===
+  Farallonic:AFPServer    1280.120:250
+  SuperMacFarm:AFPServer  1280.96:250
+... (16 total AFP servers found across AURP zones) ...
+```
+
+### Current Status (January 26, 2026)
+
+**✅ WORKING**:
+- AURP tunnel connections established with 70+ peers
+- Remote zones visible via `getzones` (11 zones including local)
+- NBP lookups to remote zones return results
+- Mac Chooser sees all zones
+- Mac Chooser shows AFP server names in remote zones!
+
+**⚠️ NOT YET WORKING**:
+- Mounting remote AFP shares from Chooser fails
+- When using jrouter, mounting works correctly
+- This is the next bug to investigate (likely AFP/ASP session establishment over AURP)
+
+**Next Investigation: Bug #15 - AFP Share Mounting**:
+
+Symptoms:
+- Mac selects AFP server in Chooser → server appears
+- Mac attempts to mount share → connection fails/times out
+- Same Mac + same server works via jrouter
+
+Hypothesis:
+- AFP session establishment requires bidirectional DDP traffic
+- Outbound packets (Mac→Server) may work, but return path (Server→Mac) may fail
+- Could be similar to the NBP issue - reply packets not reaching Mac
+- Need to capture and compare packet flow during mount attempt
 
 ---
