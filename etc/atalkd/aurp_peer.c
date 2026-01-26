@@ -674,6 +674,12 @@ void aurp_handle_open_req(struct aurp_peer *peer, char *data, int len)
      * establishes THEIR ability to send data TO us. We also need to establish
      * OUR ability to receive data FROM them by sending our own Open-Req.
      * This creates a bidirectional data path.
+     *
+     * RACE CONDITION FIX: If we're already in WAIT_OPEN_RSP state, it means
+     * we already sent them an Open-Req and are waiting for their Open-Rsp.
+     * In this case, do NOT send another Open-Req (which would create an
+     * infinite loop). Instead, just wait for their Open-Rsp to our original
+     * Open-Req. Both sides will establish their connections simultaneously.
      */
     if (peer->ap_recv_state == AURP_RECV_UNCONNECTED) {
         LOG(log_info, logtype_atalkd,
@@ -682,6 +688,10 @@ void aurp_handle_open_req(struct aurp_peer *peer, char *data, int len)
         peer->ap_recv_state = AURP_RECV_WAIT_OPEN_RSP;
         peer->ap_send_retries = 0;
         aurp_send_open_req(peer);
+    } else if (peer->ap_recv_state == AURP_RECV_WAIT_OPEN_RSP) {
+        LOG(log_info, logtype_atalkd,
+            "aurp_handle_open_req: already waiting for Open-Rsp from %s, not sending duplicate Open-Req",
+            inet_ntoa(peer->ap_addr));
     }
 }
 
