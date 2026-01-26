@@ -514,7 +514,11 @@ int aurp_init(struct aurp_config *cfg)
     int sock;
     int on = 1;
 
+    LOG(log_error, logtype_atalkd, "*** aurp_init: ENTRY - cfg=%p enabled=%d ***",
+        cfg, cfg ? cfg->ac_enabled : -1);
+
     if (!cfg || !cfg->ac_enabled) {
+        LOG(log_error, logtype_atalkd, "*** aurp_init: EARLY EXIT - no config or not enabled ***");
         return -1;
     }
 
@@ -621,19 +625,28 @@ int aurp_init(struct aurp_config *cfg)
     }
 
     /* Check if we have any peers configured */
+    LOG(log_error, logtype_atalkd, "*** aurp_init: Checking peer list - cfg->ac_peers=%p ***",
+        cfg->ac_peers);
+    
     if (cfg->ac_peers == NULL) {
-        LOG(log_info, logtype_atalkd,
-            "AURP disabled: no peers configured");
+        LOG(log_error, logtype_atalkd,
+            "*** aurp_init: AURP disabled - no peers configured ***");
         close(sock);
         aurp_fd = -1;
         return -1;
     }
 
     /* Initiate connections to configured peers */
+    LOG(log_error, logtype_atalkd, "*** aurp_init: Initiating peer connections ***");
     struct aurp_peer *peer;
+    int peer_count = 0;
     for (peer = cfg->ac_peers; peer != NULL; peer = peer->ap_next) {
+        peer_count++;
+        LOG(log_error, logtype_atalkd, "*** aurp_init: Calling aurp_peer_connect for peer #%d: %s ***",
+            peer_count, inet_ntoa(peer->ap_addr));
         aurp_peer_connect(peer);
     }
+    LOG(log_error, logtype_atalkd, "*** aurp_init: Completed %d peer connections ***", peer_count);
 
     return sock;
 }
@@ -768,17 +781,22 @@ void aurp_input(int fd)
             "*** AURP DATA PACKET RECEIVED! from %s len=%d ***",
             inet_ntoa(peer_addr), remaining);
 
-        /* Log DDP header details if present */
+        /* Log DDP header details if present.
+         * DDP Extended Header format:
+         *   [0-1] hop+len, [2-3] checksum, [4-5] dst_net, [6-7] src_net,
+         *   [8] dst_node, [9] src_node, [10] dst_socket, [11] src_socket, [12] type
+         */
         if (remaining >= 13) {
             unsigned char *dp = (unsigned char *)p;
             uint16_t hop_len = (dp[0] << 8) | dp[1];
             uint16_t ddp_len = hop_len & 0x03FF;
             uint16_t dnet = (dp[4] << 8) | dp[5];
-            uint16_t snet = (dp[8] << 8) | dp[9];
+            uint16_t snet = (dp[6] << 8) | dp[7];
             LOG(log_error, logtype_atalkd,
                 "aurp_input: DDP %u.%u.%u -> %u.%u.%u proto=%u ddp_len=%u raw_len=%d",
-                snet, dp[10], dp[11],
-                dnet, dp[6], dp[7], dp[12], ddp_len, remaining);
+                snet, dp[9], dp[11],   /* src_net, src_node, src_socket */
+                dnet, dp[8], dp[10],   /* dst_net, dst_node, dst_socket */
+                dp[12], ddp_len, remaining);
 
             if (ddp_len > remaining) {
                 LOG(log_warning, logtype_atalkd,
@@ -1142,6 +1160,9 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
         lastnet = ntohs(iface->i_rt->rt_lastnet);
         dist = 0;  /* Distance 0 for directly connected networks */
 
+        /* Check if this is an extended (Phase 2) network */
+        int is_extended = (iface->i_flags & IFACE_PHASE2) ? 1 : 0;
+
         /* Check buffer space */
         if (len + 6 > sizeof(buf)) {
             LOG(log_warning, logtype_atalkd,
@@ -1149,14 +1170,14 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
             break;
         }
 
-        if (firstnet == lastnet) {
-            /* Non-extended tuple (3 bytes) */
+        if (firstnet == lastnet && !is_extended) {
+            /* Non-extended tuple (3 bytes) - single network, Phase 1 */
             tmp = htons(firstnet);
             memcpy(buf + len, &tmp, 2);
             len += 2;
             buf[len++] = dist;
         } else {
-            /* Extended tuple (6 bytes) */
+            /* Extended tuple (6 bytes) - Phase 2 or network range */
             tmp = htons(firstnet);
             memcpy(buf + len, &tmp, 2);
             len += 2;
@@ -1168,8 +1189,8 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
         }
 
         LOG(log_error, logtype_atalkd,
-            "aurp_send_ri_rsp: adding network %u-%u dist %u",
-            firstnet, lastnet, dist);
+            "aurp_send_ri_rsp: adding network %u-%u dist %u (extended=%d)",
+            firstnet, lastnet, dist, is_extended);
         added_count++;
     }
     
@@ -1974,6 +1995,10 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
     uint8_t dst_node, src_node, dst_socket;
     int ddp_len;
 
+    LOG(log_error, logtype_atalkd,
+        "*** aurp_handle_data: ENTRY - peer=%s len=%d ***",
+        inet_ntoa(peer->ap_addr), len);
+
     /* Need at least the DDP header (12 bytes) + type (1 byte) */
     if (len < 13) {
         LOG(log_warning, logtype_atalkd,
@@ -1981,15 +2006,15 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         return;
     }
 
-    /* Parse DDP extended header manually (struct ddpehdr has fields in wrong order!)
-     * Wire format:
+    /* Parse DDP extended header manually.
+     * DDP Extended Header format (13 bytes):
      *   Bytes 0-1: Hop count (4 bits) + Length (10 bits)
      *   Bytes 2-3: Checksum
-     *   Bytes 4-5: Dest Network
-     *   Byte 6:    Dest Node
-     *   Byte 7:    Dest Socket
-     *   Bytes 8-9: Source Network
-     *   Byte 10:   Source Node
+     *   Bytes 4-5: Destination Network
+     *   Bytes 6-7: Source Network
+     *   Byte 8:    Destination Node
+     *   Byte 9:    Source Node
+     *   Byte 10:   Destination Socket
      *   Byte 11:   Source Socket
      *   Byte 12:   DDP Type
      */
@@ -1999,12 +2024,11 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
     ddp_len = hop_len & 0x3FF;
     
     dst_net = (p[4] << 8) | p[5];
-    dst_node = p[6];
-    dst_socket = p[7];
-    
-    src_net = (p[8] << 8) | p[9];
-    src_node = p[10];
-    /* src_socket not used but would be p[11] */
+    src_net = (p[6] << 8) | p[7];
+    dst_node = p[8];
+    src_node = p[9];
+    dst_socket = p[10];
+    /* src_socket = p[11]; */
     if (ddp_len < 13 || ddp_len > len) {
         LOG(log_warning, logtype_atalkd,
             "aurp_handle_data: invalid DDP length %d (packet len %d)",

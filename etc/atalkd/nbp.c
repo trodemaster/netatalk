@@ -99,21 +99,33 @@ static int nbp_send_zone_multicast(struct interface *iface,
 
     src_net_host = ntohs(iface->i_addr.sat_addr.s_net);
 
+    /* Build extended DDP header.
+     * DDP Extended Header format (13 bytes):
+     *   [0-1]  hop (4 bits) + length (10 bits)
+     *   [2-3]  checksum
+     *   [4-5]  destination network
+     *   [6-7]  source network
+     *   [8]    destination node
+     *   [9]    source node
+     *   [10]   destination socket
+     *   [11]   source socket
+     *   [12]   DDP type
+     */
     pos = 0;
     hop_len = (0 << 10) | (ddp_len & 0x3FF);
-    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;
-    ddp_packet[pos++] = hop_len & 0xFF;
-    ddp_packet[pos++] = 0x00;
-    ddp_packet[pos++] = 0x00;
-    ddp_packet[pos++] = 0x00;
-    ddp_packet[pos++] = 0x00;
-    ddp_packet[pos++] = ATADDR_BCAST;
-    ddp_packet[pos++] = 2;
-    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;
-    ddp_packet[pos++] = src_net_host & 0xFF;
-    ddp_packet[pos++] = iface->i_addr.sat_addr.s_node;
-    ddp_packet[pos++] = 2;
-    ddp_packet[pos++] = DDPTYPE_NBP;
+    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;  /* Byte 0: hop/len high */
+    ddp_packet[pos++] = hop_len & 0xFF;         /* Byte 1: hop/len low */
+    ddp_packet[pos++] = 0x00;                   /* Byte 2: checksum high */
+    ddp_packet[pos++] = 0x00;                   /* Byte 3: checksum low */
+    ddp_packet[pos++] = 0x00;                   /* Byte 4: dst_net high (net 0 = local) */
+    ddp_packet[pos++] = 0x00;                   /* Byte 5: dst_net low */
+    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;  /* Byte 6: src_net high */
+    ddp_packet[pos++] = src_net_host & 0xFF;         /* Byte 7: src_net low */
+    ddp_packet[pos++] = ATADDR_BCAST;           /* Byte 8: dst_node (broadcast) */
+    ddp_packet[pos++] = iface->i_addr.sat_addr.s_node;  /* Byte 9: src_node */
+    ddp_packet[pos++] = 2;                      /* Byte 10: dst_socket (NBP = 2) */
+    ddp_packet[pos++] = 2;                      /* Byte 11: src_socket (NBP = 2) */
+    ddp_packet[pos++] = DDPTYPE_NBP;            /* Byte 12: DDP type */
 
     memcpy(ddp_packet + pos, nbp_payload, nbp_len);
 
@@ -208,6 +220,10 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
     /* initialize per valgrind */
     memset(&sat, 0, sizeof(struct sockaddr_at));
     end = data + len;
+
+    LOG(log_warning, logtype_atalkd,
+        "nbp_packet: received %d bytes from %u.%u.%u",
+        len, ntohs(from->sat_addr.s_net), from->sat_addr.s_node, from->sat_port);
 
     if (data >= end) {
         LOG(log_info, logtype_atalkd, "nbp_packet malformed packet");
@@ -490,6 +506,11 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
          * and we know what the sender meant by '*', we copy the real
          * zone into the packet.
          */
+        LOG(log_warning, logtype_atalkd,
+            "nbp brrq: received BrRq for zone '%.*s' from %u.%u.%u",
+            nn.nn_zonelen, nn.nn_zone,
+            ntohs(from->sat_addr.s_net), from->sat_addr.s_node, from->sat_port);
+
         if (nn.nn_zonelen == 0 ||
                 (nn.nn_zonelen == 1 && *nn.nn_zone == '*')) {
             iface = ap->ap_iface;
@@ -517,14 +538,24 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                 len = data - packet;
             }
         } else {
+            LOG(log_warning, logtype_atalkd,
+                "nbp brrq: searching ziptab for zone '%.*s' (len=%d)",
+                nn.nn_zonelen, nn.nn_zone, nn.nn_zonelen);
+            int zone_count = 0;
             for (zt = ziptab; zt; zt = zt->zt_next) {
+                zone_count++;
                 if (zt->zt_len == nn.nn_zonelen && strndiacasecmp(zt->zt_name,
                         nn.nn_zone, zt->zt_len) == 0) {
+                    LOG(log_warning, logtype_atalkd,
+                        "nbp brrq: FOUND zone '%.*s' in ziptab", zt->zt_len, zt->zt_name);
                     break;
                 }
             }
 
             if (zt == NULL) {
+                LOG(log_warning, logtype_atalkd,
+                    "nbp brrq: zone '%.*s' NOT FOUND in ziptab (searched %d zones)",
+                    nn.nn_zonelen, nn.nn_zone, zone_count);
                 nbp_ack(ap->ap_fd, NBPOP_ERROR, (int)nh.nh_id, from);
                 return 0;
             }
@@ -713,8 +744,18 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                         continue;
                     }
 
-                    /* Build extended DDP header manually in correct byte order
-                     * The struct ddpehdr has fields in wrong order for wire format! */
+                    /* Build extended DDP header manually in correct byte order.
+                     * DDP Extended Header format (13 bytes):
+                     *   [0-1]  hop (4 bits) + length (10 bits)
+                     *   [2-3]  checksum
+                     *   [4-5]  destination network
+                     *   [6-7]  source network
+                     *   [8]    destination node
+                     *   [9]    source node
+                     *   [10]   destination socket
+                     *   [11]   source socket
+                     *   [12]   DDP type
+                     */
                     int pos = 0;
 
                     /* Bytes 0-1: Hop count (4 bits) + Length (10 bits) in BIG ENDIAN */
@@ -730,20 +771,20 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     ddp_packet[pos++] = (dst_net >> 8) & 0xFF;
                     ddp_packet[pos++] = dst_net & 0xFF;
 
-                    /* Byte 6: Destination Node */
-                    ddp_packet[pos++] = sat.sat_addr.s_node;
-
-                    /* Byte 7: Destination Socket */
-                    ddp_packet[pos++] = sat.sat_port;
-
-                    /* Bytes 8-9: Source Network (big-endian) - router interface */
+                    /* Bytes 6-7: Source Network (big-endian) */
                     ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;
                     ddp_packet[pos++] = src_net_host & 0xFF;
 
-                    /* Byte 10: Source Node - router interface */
+                    /* Byte 8: Destination Node (0 for zone broadcast) */
+                    ddp_packet[pos++] = sat.sat_addr.s_node;
+
+                    /* Byte 9: Source Node */
                     ddp_packet[pos++] = src_node;
 
-                    /* Byte 11: Source Socket - NBP socket */
+                    /* Byte 10: Destination Socket (NBP = 2) */
+                    ddp_packet[pos++] = sat.sat_port;
+
+                    /* Byte 11: Source Socket */
                     ddp_packet[pos++] = src_socket;
 
                     /* Byte 12: DDP Type (NBP = 0x02) */
@@ -888,22 +929,33 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                             continue;
                         }
                         
-                        /* Build extended DDP header */
+                        /* Build extended DDP header.
+                         * DDP Extended Header format (13 bytes):
+                         *   [0-1]  hop (4 bits) + length (10 bits)
+                         *   [2-3]  checksum
+                         *   [4-5]  destination network
+                         *   [6-7]  source network
+                         *   [8]    destination node
+                         *   [9]    source node
+                         *   [10]   destination socket
+                         *   [11]   source socket
+                         *   [12]   DDP type
+                         */
                         int pos = 0;
                         uint16_t hop_len = (0 << 10) | (total_len & 0x3FF);
                         ddp_packet[pos++] = (hop_len >> 8) & 0xFF;
                         ddp_packet[pos++] = hop_len & 0xFF;
                         ddp_packet[pos++] = 0x00;  /* Checksum */
                         ddp_packet[pos++] = 0x00;
-                        ddp_packet[pos++] = (dst_net >> 8) & 0xFF;
+                        ddp_packet[pos++] = (dst_net >> 8) & 0xFF;  /* Bytes 4-5: dst_net */
                         ddp_packet[pos++] = dst_net & 0xFF;
-                        ddp_packet[pos++] = 0;     /* Router node */
-                        ddp_packet[pos++] = 2;     /* NBP socket */
-                        ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;
+                        ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;  /* Bytes 6-7: src_net */
                         ddp_packet[pos++] = src_net_host & 0xFF;
-                        ddp_packet[pos++] = src_node;
-                        ddp_packet[pos++] = src_socket;
-                        ddp_packet[pos++] = DDPTYPE_NBP;
+                        ddp_packet[pos++] = 0;     /* Byte 8: dst_node (0 = zone broadcast) */
+                        ddp_packet[pos++] = src_node;  /* Byte 9: src_node */
+                        ddp_packet[pos++] = 2;     /* Byte 10: dst_socket (NBP = 2) */
+                        ddp_packet[pos++] = src_socket;  /* Byte 11: src_socket */
+                        ddp_packet[pos++] = DDPTYPE_NBP;  /* Byte 12: ddp_type */
                         
                         /* Convert LkUp to FwdReq */
                         struct nbphdr nh_fwd;

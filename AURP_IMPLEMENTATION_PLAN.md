@@ -933,6 +933,32 @@ Jan 15 06:12:27 atalkd[118025]: aurp_input: received 30 bytes from 188.121.19.68
 2. 🔍 If still no responses, compare full packet captures (atalkd vs jrouter) for any remaining differences
 3. 🐛 Investigate if destination node (0 vs specific router node) matters for AURP NBP forwarding
 
+**UPDATE (Jan 25, 2026 18:45 UTC) - AURP Connection State Bugs Found**:
+
+**Bug #11: Missing ap_send_state Update in aurp_handle_open_rsp** (Fixed)
+- **Problem**: When receiving Open-Rsp from peer (accepting our connection), `aurp_handle_open_rsp()` set `ap_recv_state` but NOT `ap_send_state`
+- **Impact**: Send channel never transitioned to CONNECTED state, remained UNCONNECTED
+- **Symptoms**:
+  - Logs showed `recv_state=CONNECTED send_state=UNCONNECTED` everywhere
+  - NBP FwdReq packets sent but ZERO replies received
+  - jrouter worked perfectly on same system, proving packet format was correct
+- **Fix**: Added `peer->ap_send_state = AURP_SEND_CONNECTED;` in `/home/blake/code/netatalk/etc/atalkd/aurp_peer.c` line 732
+- **Result**: All peers now show `send_state=CONNECTED` ✅
+
+**Bug #12: Peers Not Responding to Our Open-Req** (INVESTIGATING)
+- **Problem**: After Bug #11 fix, peers still not responding with Open-Rsp to our outbound Open-Req
+- **Symptoms**:
+  - We send Open-Req to establish receive channel: `recv_state=WAIT_OPEN_RSP`
+  - Peers send us THEIR Open-Req (we respond with Open-Rsp): `send_state=CONNECTED`
+  - But peers never send Open-Rsp to OUR Open-Req
+  - Still ZERO AppleTalk Data packets received (type 0x0002)
+- **Status**: 🔍 ACTIVE INVESTIGATION
+- **Hypothesis**: 
+  - Open-Req packet format issue (connection ID, flags, sequence number?)
+  - Peers may not support bidirectional connection establishment
+  - Possible conflict when both sides send Open-Req simultaneously
+- **Next**: Compare Open-Req packet format with jrouter, examine connection establishment flow
+
 ---
 
 ## Key Reference Files
@@ -2629,3 +2655,77 @@ Inbound DDP types:
 
 **End of Implementation Plan**
 
+---
+
+## Bug #13 Fix - Missing Send State Update (January 25, 2026 - 19:05 UTC)
+
+### Bug #13: send_state Not Set in aurp_handle_open_rsp
+
+**Problem**: After establishing AURP connections, `aurp_dump_peers` showed all peers with `send_state=UNCONNECTED` (0) even though they were clearly sending tickles and appeared connected.
+
+**Root Cause**: The `aurp_handle_open_rsp()` function (which processes Open-Rsp packets from peers when they accept our Open-Req) was updating timeouts and setting send_retries=0, but was NOT setting `ap_send_state = AURP_SEND_CONNECTED`. This meant the send channel stayed in UNCONNECTED state even though the peer had accepted our connection.
+
+**AURP Bidirectional Channels**:
+- **Send channel** (us→peer): We send data TO peer. State: `ap_send_state`
+  - Established when PEER sends Open-Rsp accepting OUR Open-Req
+  - Should transition: UNCONNECTED → CONNECTED
+- **Receive channel** (peer→us): We receive data FROM peer. State: `ap_recv_state`  
+  - Established when WE send Open-Rsp accepting PEER's Open-Req
+  - Transitions: UNCONNECTED → WAIT_OPEN_RSP (after we send Open-Req) → CONNECTED
+
+**Fix**: Added one line to `aurp_handle_open_rsp()`:
+```c
+peer->ap_send_state = AURP_SEND_CONNECTED;  /* Mark send channel as connected */
+```
+
+**File Changed**: `/home/blake/code/netatalk/etc/atalkd/aurp_peer.c` line 732
+
+**Result**: All peers now correctly show `send_state=CONNECTED` after Open-Rsp is received.
+
+**Investigation Status (January 25, 2026 - 19:05 UTC)**:
+
+Despite fixing Bug #13, Mac Chooser still shows ZERO remote AFP servers (jrouter shows 30+ on same system).
+
+**Current Debugging Findings**:
+
+1. ✅ **AURP Connections Working**:
+   - 20+ peers with BOTH channels connected (`recv_state=CONNECTED send_state=CONNECTED`)
+   - 50+ peers in WAIT_TICKLE_ACK state (connected, awaiting tickle acknowledgement)
+   - Bidirectional packet flow confirmed (Tickle/Tickle-Ack exchange)
+
+2. ✅ **NBP Queries Being Sent**:
+   - 284 outgoing AURP data packets sent in 5-minute window
+   - All formatted correctly (verified against jrouter packets)
+   - Targeting correct remote networks
+
+3. ❌ **NBP Replies NOT Received**:
+   - Only 10 incoming AURP data packets in same 5-minute window
+   - ALL 10 packets are FwdReq (op=4) FROM remote peers TO us
+   - ZERO LkUpReply (op=5) packets received
+   - ZERO incoming data destined for Mac Chooser (650.24.253)
+
+4. ✅ **Incoming FwdReq Packets Working**:
+   - Peer 91.35.155.59 sending NBP FwdReq queries TO us
+   - Queries properly received and processed
+   - Proves AURP data channel is bidirectional
+
+**Key Mystery**: 
+- We're sending NBP queries correctly (format verified)
+- Remote peers ARE connected (bidirectional Tickle exchange)
+- Remote peers CAN send us data (we receive their FwdReq queries)
+- But remote peers are NOT sending us LkUpReply responses to OUR queries
+
+**Hypothesis**: The outgoing NBP query packets may have a subtle formatting issue that jrouter handles correctly but netatalk doesn't. Even though byte-by-byte comparison shows packets match, there may be:
+- Timing issue (replies sent before we're ready to receive)
+- Socket/port mismatch (replies going to wrong destination)
+- NBP ID tracking issue (replies don't match our query IDs)
+- DDP addressing issue in the query (replies can't find route back to us)
+
+**Next Steps**:
+1. Capture packets with tcpdump during active browsing
+2. Compare netatalk NBP query vs jrouter NBP query in detail
+3. Check if replies are being sent but to wrong address
+4. Verify NBP request tracking (`aurp_nbp_track`) is working
+5. Add more detailed logging to `aurp_handle_data` NBP reply path
+
+---

@@ -128,6 +128,13 @@ def summarize(path, local_ip=None, top_n=10, sample_inbound=False, sample_count=
     out_cmds = Counter()
     in_cmds_by_peer = {}
     out_cmds_by_peer = {}
+    
+    # Track connection IDs for Open-Req/Open-Rsp analysis
+    out_open_req_conn_ids = {}  # peer -> list of conn_ids we sent
+    in_open_req_conn_ids = {}   # peer -> list of conn_ids they sent
+    in_open_rsp_conn_ids = {}   # peer -> list of conn_ids in their Open-Rsp
+    in_tickle_conn_ids = {}     # peer -> list of conn_ids in their Tickle
+    out_tickle_conn_ids = {}    # peer -> list of conn_ids in our Tickle
 
     for src, dst, payload in packets:
         if len(payload) < 22:
@@ -152,9 +159,15 @@ def summarize(path, local_ip=None, top_n=10, sample_inbound=False, sample_count=
             elif pkt_type == AURP_PKT_ROUTING:
                 out_0003 += 1
                 if len(payload) >= 30:
+                    conn_id = struct.unpack("!H", payload[22:24])[0]
                     cmd = struct.unpack("!H", payload[26:28])[0]
                     out_cmds[cmd] += 1
                     out_cmds_by_peer.setdefault(dst, Counter())[cmd] += 1
+                    # Track connection IDs for specific commands
+                    if cmd == 0x0008:  # Open-Req
+                        out_open_req_conn_ids.setdefault(dst, []).append(conn_id)
+                    elif cmd == 0x000e:  # Tickle
+                        out_tickle_conn_ids.setdefault(dst, []).append(conn_id)
         else:
             in_peers[src] += 1
             if pkt_type == AURP_PKT_APPLETALK:
@@ -172,9 +185,17 @@ def summarize(path, local_ip=None, top_n=10, sample_inbound=False, sample_count=
             elif pkt_type == AURP_PKT_ROUTING:
                 in_0003 += 1
                 if len(payload) >= 30:
+                    conn_id = struct.unpack("!H", payload[22:24])[0]
                     cmd = struct.unpack("!H", payload[26:28])[0]
                     in_cmds[cmd] += 1
                     in_cmds_by_peer.setdefault(src, Counter())[cmd] += 1
+                    # Track connection IDs for specific commands
+                    if cmd == 0x0008:  # Open-Req
+                        in_open_req_conn_ids.setdefault(src, []).append(conn_id)
+                    elif cmd == 0x0009:  # Open-Rsp
+                        in_open_rsp_conn_ids.setdefault(src, []).append(conn_id)
+                    elif cmd == 0x000e:  # Tickle
+                        in_tickle_conn_ids.setdefault(src, []).append(conn_id)
 
     print(f"local_ip {local_ip}")
     print(f"in_type0002 {in_0002}")
@@ -249,6 +270,40 @@ def summarize(path, local_ip=None, top_n=10, sample_inbound=False, sample_count=
         for peer, cmds in peers[:top_n]:
             summary = ", ".join(f"{AURP_CMDS.get(cmd, 'Unknown')}={count}" for cmd, count in cmds.most_common())
             print(f"  {peer}: {summary}")
+
+    # Connection ID analysis
+    if out_open_req_conn_ids or in_open_rsp_conn_ids or in_tickle_conn_ids:
+        print("\n=== Connection ID Analysis ===")
+        all_peers = set(out_open_req_conn_ids.keys()) | set(in_open_rsp_conn_ids.keys()) | set(in_tickle_conn_ids.keys()) | set(in_open_req_conn_ids.keys())
+        for peer in sorted(all_peers)[:top_n]:
+            print(f"\n  Peer {peer}:")
+            if peer in out_open_req_conn_ids:
+                ids = out_open_req_conn_ids[peer]
+                unique = set(ids)
+                print(f"    Our Open-Req conn_ids: {[hex(x) for x in unique]} (sent {len(ids)}x)")
+            if peer in in_open_rsp_conn_ids:
+                ids = in_open_rsp_conn_ids[peer]
+                unique = set(ids)
+                print(f"    Their Open-Rsp conn_ids: {[hex(x) for x in unique]} (recv {len(ids)}x)")
+            if peer in in_open_req_conn_ids:
+                ids = in_open_req_conn_ids[peer]
+                unique = set(ids)
+                print(f"    Their Open-Req conn_ids: {[hex(x) for x in unique]} (recv {len(ids)}x)")
+            if peer in in_tickle_conn_ids:
+                ids = in_tickle_conn_ids[peer]
+                unique = set(ids)
+                print(f"    Their Tickle conn_ids: {[hex(x) for x in unique]} (recv {len(ids)}x)")
+            if peer in out_tickle_conn_ids:
+                ids = out_tickle_conn_ids[peer]
+                unique = set(ids)
+                print(f"    Our Tickle conn_ids: {[hex(x) for x in unique]} (sent {len(ids)}x)")
+            # Check for mismatches
+            our_open_ids = set(out_open_req_conn_ids.get(peer, []))
+            their_rsp_ids = set(in_open_rsp_conn_ids.get(peer, []))
+            their_tickle_ids = set(in_tickle_conn_ids.get(peer, []))
+            if our_open_ids and their_tickle_ids and not their_rsp_ids:
+                if our_open_ids != their_tickle_ids:
+                    print(f"    !! MISMATCH: We sent Open-Req with {[hex(x) for x in our_open_ids]} but they Tickle with {[hex(x) for x in their_tickle_ids]}")
 
     if inbound_samples:
         print("\nInbound type0002 samples (first 64 bytes):")

@@ -368,7 +368,7 @@ void aurp_peer_connect(struct aurp_peer *peer)
         return;
     }
 
-    LOG(log_info, logtype_atalkd, "aurp_peer_connect: connecting to %s",
+    LOG(log_error, logtype_atalkd, "*** aurp_peer_connect: CALLED for %s ***",
         inet_ntoa(peer->ap_addr));
 
     /* Set state */
@@ -380,7 +380,11 @@ void aurp_peer_connect(struct aurp_peer *peer)
     peer->ap_tickle_retries = 0;
 
     /* Send Open-Req */
-    aurp_send_open_req(peer);
+    LOG(log_error, logtype_atalkd, "*** Calling aurp_send_open_req for %s ***",
+        inet_ntoa(peer->ap_addr));
+    int result = aurp_send_open_req(peer);
+    LOG(log_error, logtype_atalkd, "*** aurp_send_open_req returned %d for %s ***",
+        result, inet_ntoa(peer->ap_addr));
 }
 
 /* Disconnect from peer */
@@ -727,13 +731,14 @@ void aurp_handle_open_rsp(struct aurp_peer *peer, char *data, int len)
 
     /* Connection accepted - request routing information */
     peer->ap_recv_state = AURP_RECV_WAIT_RI_RSP;
+    peer->ap_send_state = AURP_SEND_CONNECTED;  /* Mark send channel as connected */
     peer->ap_send_retries = 0;
     peer->ap_flags |= AURP_PEER_CONNECTED;
 
     aurp_send_ri_req(peer);
 
     LOG(log_info, logtype_atalkd,
-        "aurp_handle_open_rsp: connection accepted by %s (rate=%d)",
+        "aurp_handle_open_rsp: connection accepted by %s (rate=%d, send_state=CONNECTED)",
         inet_ntoa(peer->ap_addr), error_code);
 }
 

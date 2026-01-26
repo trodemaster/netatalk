@@ -8,3 +8,4 @@ include/atalk/afp_dtrace.h
 build/**
 *.pot
 tmp_packetcaptures/*
+tools/__pycache__/*
