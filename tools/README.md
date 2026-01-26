@@ -100,6 +100,52 @@ python3 nbp_zone_scan.py --type Workstation
 
 ---
 
+### aurp_packet_compare.py
+
+**Purpose**: Compares AURP packets between two pcap captures byte-by-byte to identify protocol differences. Essential for debugging when comparing netatalk behavior against a reference implementation like jrouter.
+
+**Usage**:
+```bash
+python3 aurp_packet_compare.py <pcap1> <pcap2> [packet_type]
+```
+
+**Arguments**:
+- `pcap1`: First pcap file (e.g., jrouter capture)
+- `pcap2`: Second pcap file (e.g., netatalk capture)
+- `packet_type`: Type of packet to compare (default: `open-req`)
+
+**Supported Packet Types**:
+- `open-req`: Connection initiation request
+- `open-rsp`: Connection initiation response
+- `ri-req`: Routing Information request
+- `ri-rsp`: Routing Information response
+- `ri-ack`: Routing Information acknowledgment
+- `ri-upd`: Routing Information update
+- `zi-req`: Zone Information request
+- `zi-rsp`: Zone Information response
+- `tickle`: Keepalive packet
+- `tickle-ack`: Keepalive acknowledgment
+
+**Features**:
+- Finds first matching packet of specified type in each capture
+- Shows raw hex dump of each packet
+- Performs byte-by-byte comparison with visual diff markers
+- Lists all byte offsets where differences occur
+- Helpful for identifying subtle protocol bugs
+
+**Example**:
+```bash
+# Compare Open-Req packets between jrouter and netatalk
+python3 aurp_packet_compare.py jrouter.pcap netatalk.pcap open-req
+
+# Compare Tickle packets
+python3 aurp_packet_compare.py capture1.pcap capture2.pcap tickle
+```
+
+**Dependencies**: Requires `scapy` (`pip install scapy`)
+
+---
+
 ### test_nbp_replies.sh
 
 **Purpose**: Automated test to verify if netatalk is receiving NBP replies from remote AURP peers. Combines packet capture with zone scanning to diagnose reply issues without requiring a Mac.
