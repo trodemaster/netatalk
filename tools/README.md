@@ -146,6 +146,117 @@ python3 aurp_packet_compare.py capture1.pcap capture2.pcap tickle
 
 ---
 
+### mount_appletalk.sh
+
+**Purpose**: Interactive tool for mounting AFP file shares via AppleTalk from a Linux client. Attempts to use available AFP mounting utilities to establish connections to remote AFP servers discovered via AppleTalk.
+
+**Usage**:
+```bash
+./mount_appletalk.sh <zone> <server> <share> <mount_point> [username]
+```
+
+**Arguments**:
+- `zone`: AppleTalk zone name (e.g., "BaroNet")
+- `server`: AppleTalk server name (e.g., "Blackbird")
+- `share`: Share/volume name to mount (e.g., "Public")
+- `mount_point`: Local directory path for mount point (e.g., "/mnt/afp")
+- `username`: (Optional) Username for authentication (default: "guest")
+
+**Features**:
+- Auto-detects available AFP client tools (`mount_afp`, `afp_client`, or kernel AFP support)
+- Creates mount point directory if it doesn't exist
+- Detects and prompts to unmount if mount point is already in use
+- Constructs proper AFP URLs for AppleTalk connections (`afp://at/Zone:Server/Share`)
+- Supports both guest and authenticated mounts
+- Color-coded output for success/error messages
+- Provides troubleshooting tips on failure
+
+**AFP URL Format**:
+- Guest: `afp://at/Zone:Server/Share`
+- Authenticated: `afp://username@at/Zone:Server/Share`
+
+**Example**:
+```bash
+# Mount as guest (default)
+./mount_appletalk.sh "BaroNet" "Blackbird" "Public" "/mnt/blackbird"
+
+# Mount with authentication
+./mount_appletalk.sh "BaroNet" "landisk" "Data" "/mnt/landisk" "admin"
+
+# Unmount when done
+umount /mnt/blackbird
+```
+
+**Requirements**:
+- One of: `afpfs-ng` package, macOS `mount_afp`, or kernel AFP support
+- atalkd service running and connected to AppleTalk network
+- AppleTalk routing to the target zone/network
+
+**Troubleshooting**:
+- **"No AFP mounting tool found"**: Install `afpfs-ng` on Linux (`apt install afpfs-ng`)
+- **"Failed to mount"**: Verify AppleTalk connectivity with `ping` or `nbplkup`
+- **Connection hangs**: Check that AURP routes exist to target network (check routing table)
+- **Authentication fails**: Verify username/password, try guest mount first
+
+**Note**: This tool requires AFP client libraries which are not commonly available on Linux systems. Most modern Linux distributions do not include AFP mounting support. The script will detect available tools and attempt to use them, but may fail if no AFP client is installed.
+
+---
+
+### diagnose_afp_mount.sh
+
+**Purpose**: Interactive diagnostic tool to capture and analyze network traffic during AFP mount attempts from Mac clients. Helps identify the exact point of failure when AFP mounts don't work over AURP.
+
+**Usage**:
+```bash
+./diagnose_afp_mount.sh
+```
+
+**Interactive Procedure**:
+1. Starts packet capture on UDP port 387 (AppleTalk/AURP)
+2. Waits for user to attempt AFP mount from Mac Chooser
+3. Stops capture when mount attempt completes
+4. Analyzes captured packets to diagnose failure point
+
+**Analysis Output**:
+- **Packet counts** by DDP protocol type:
+  - RTMP (type 1): Routing updates
+  - NBP (type 2): Name lookups
+  - ATP (type 3): File transfer connections
+- **Diagnostic results**:
+  - ✓ NBP working: Mac found the server
+  - ⨯ ATP missing: Mac can't connect to server (most common)
+  - ⨯ NBP missing: Mac didn't look up server name
+- **Recent atalkd logs**: Shows routing, connection, and error messages
+- **Recommendations**: Specific troubleshooting steps based on symptoms
+
+**Common Findings**:
+- **NBP packets but no ATP**: Mac lacks route to server's network
+  - Check RTMP broadcasts reach Mac
+  - Verify Mac's routing table includes remote networks
+  - Ensure AURP routes have zone information before broadcast
+- **No NBP packets**: Mac didn't browse or click server
+  - User didn't interact with Chooser properly
+  - Capture started too late
+- **Both NBP and ATP**: Connection established, failure is AFP-level
+  - Check authentication, permissions, protocol version
+
+**Output Files**:
+- Capture saved to: `../tmp_packetcaptures/afp_mount_debug_YYYYMMDD_HHMMSS.pcap`
+
+**Example Session**:
+```bash
+./diagnose_afp_mount.sh
+# Press ENTER to start
+# [Open Chooser on Mac, click on server]
+# [Wait for mount to fail or succeed]
+# Press ENTER to analyze
+# View results and recommendations
+```
+
+**Dependencies**: Requires `tcpdump` and `journalctl`. Mac client must be on local network segment.
+
+---
+
 ### test_nbp_replies.sh
 
 **Purpose**: Automated test to verify if netatalk is receiving NBP replies from remote AURP peers. Combines packet capture with zone scanning to diagnose reply issues without requiring a Mac.

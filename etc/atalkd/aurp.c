@@ -37,6 +37,7 @@
 #include "list.h"
 #include "multicast.h"
 #include "nbp.h"
+#include "main.h"
 
 #ifdef __linux__
 #include <linux/if_packet.h>
@@ -2622,6 +2623,37 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
     /* Send the packet (skip DDP header, send from type byte onwards)
      * This forwards the packet directly to the destination node on the local network
      * Per jrouter: "Output the packet!" - just forward it, don't process it */
+#ifdef __linux__
+    /* On Linux, use raw sockets to preserve the original source address.
+     * AF_APPLETALK sockets overwrite the source with the router's address,
+     * which breaks protocols like ATP that expect consistent addressing. */
+    {
+        struct sockaddr_at src_sat;
+        unsigned char dest_hw[6] = {0x09, 0x00, 0x07, 0xFF, 0xFF, 0xFF}; /* AppleTalk broadcast MAC */
+        
+        /* Extract source address from DDP header */
+        memset(&src_sat, 0, sizeof(src_sat));
+#ifdef BSD4_4
+        src_sat.sat_len = sizeof(struct sockaddr_at);
+#endif
+        src_sat.sat_family = AF_APPLETALK;
+        src_sat.sat_addr.s_net = htons((data[6] << 8) | data[7]);
+        src_sat.sat_addr.s_node = data[9];
+        src_sat.sat_port = data[11];
+        
+        if (sendto_iface_raw(dest_iface, data + 12, len - 12,
+                            &src_sat, &sat, dest_hw) < 0) {
+            LOG(log_warning, logtype_atalkd,
+                "aurp_handle_data: sendto_iface_raw(%u.%u.%u) failed: %s",
+                dst_net, dst_node, dst_socket, strerror(errno));
+        } else {
+            LOG(log_error, logtype_atalkd,
+                "*** aurp_handle_data: RAW forwarded %u.%u.%u -> %u.%u.%u ***",
+                ntohs(src_sat.sat_addr.s_net), src_sat.sat_addr.s_node, src_sat.sat_port,
+                dst_net, dst_node, dst_socket);
+        }
+    }
+#else
     if (sendto(ap->ap_fd, data + 12, len - 12, 0,
                (struct sockaddr *)&sat, sizeof(sat)) < 0) {
         LOG(log_warning, logtype_atalkd,
@@ -2637,6 +2669,7 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
                 dest_iface->i_name, ap->ap_port, dst_net, dst_node, dst_socket);
         }
     }
+#endif
 }
 
 /*

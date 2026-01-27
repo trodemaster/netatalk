@@ -15,4 +15,13 @@ void setaddr(struct interface *, uint8_t, uint16_t,
 void bootaddr(struct interface *);
 void dumpconfig(struct interface *);
 
+#ifdef __linux__
+#include <linux/if_packet.h>
+ssize_t sendto_iface_raw(struct interface *iface,
+                         const void *buf, size_t len,
+                         const struct sockaddr_at *src_addr,
+                         const struct sockaddr_at *dest_addr,
+                         const unsigned char *dest_hw);
+#endif
+
 #endif /* ATALKD_MAIN_H */

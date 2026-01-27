@@ -46,6 +46,14 @@
 #include <termios.h>
 #endif /* __svr4__ */
 
+#ifdef __linux__
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
+#ifndef ETH_P_AT
+#define ETH_P_AT 0x809B
+#endif
+#endif
+
 #include "interface.h"
 #include "gate.h"
 #include "list.h"
@@ -134,12 +142,255 @@ static void atalkd_exit(const int i)
  * moreover there's no way to put an interface back short of restarting atalkd
  * thus after the first time, silently fail
 */
+#ifdef __linux__
+/* Send packet using raw Ethernet frames with specified source address
+ * Used by AURP to forward packets while preserving the original source address */
+ssize_t sendto_iface_raw(struct interface *iface,
+                         const void *buf, size_t len,
+                         const struct sockaddr_at *src_addr,
+                         const struct sockaddr_at *dest_addr,
+                         const unsigned char *dest_hw)
+{
+    int fd;
+    struct ifreq ifr;
+    unsigned char src_hw[6];
+    unsigned char frame[1500];
+    unsigned char ddp_packet[1500];
+    int ddp_len;
+    uint16_t hop_len, llc_len;
+    int frame_len;
+    int ifindex;
+    struct sockaddr_ll sll;
+    uint16_t src_net_host, dst_net_host;
+    int pos;
+    ssize_t ret;
+
+    /* Build DDP header + payload */
+    ddp_len = 13 + len - 1;  /* 13 byte DDP header + payload (minus DDP type byte already in buf) */
+    if (ddp_len > (int)sizeof(ddp_packet)) {
+        return -1;
+    }
+
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_802_2));
+    if (fd < 0) {
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface->i_name, sizeof(ifr.ifr_name) - 1);
+
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+    ifindex = ifr.ifr_ifindex;
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+    memcpy(src_hw, ifr.ifr_hwaddr.sa_data, sizeof(src_hw));
+
+    src_net_host = ntohs(src_addr->sat_addr.s_net);
+    dst_net_host = ntohs(dest_addr->sat_addr.s_net);
+
+    /* Build extended DDP header */
+    pos = 0;
+    hop_len = (0 << 10) | (ddp_len & 0x3FF);
+    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;
+    ddp_packet[pos++] = hop_len & 0xFF;
+    ddp_packet[pos++] = 0x00;  /* checksum */
+    ddp_packet[pos++] = 0x00;
+    ddp_packet[pos++] = (dst_net_host >> 8) & 0xFF;
+    ddp_packet[pos++] = dst_net_host & 0xFF;
+    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;  /* Use specified source */
+    ddp_packet[pos++] = src_net_host & 0xFF;
+    ddp_packet[pos++] = dest_addr->sat_addr.s_node;
+    ddp_packet[pos++] = src_addr->sat_addr.s_node;   /* Use specified source node */
+    ddp_packet[pos++] = dest_addr->sat_port;
+    ddp_packet[pos++] = src_addr->sat_port;           /* Use specified source port */
+
+    /* Copy payload (includes DDP type byte) */
+    memcpy(ddp_packet + pos, buf, len);
+
+    /* Build Ethernet frame with LLC/SNAP header */
+    memcpy(frame, dest_hw, 6);     /* Destination MAC */
+    memcpy(frame + 6, src_hw, 6);  /* Source MAC (our interface) */
+    llc_len = htons((uint16_t)(8 + ddp_len));
+    memcpy(frame + 12, &llc_len, sizeof(llc_len));
+    frame[14] = 0xAA;  /* LLC DSAP */
+    frame[15] = 0xAA;  /* LLC SSAP */
+    frame[16] = 0x03;  /* LLC Control */
+    frame[17] = 0x00;  /* SNAP OUI */
+    frame[18] = 0x00;
+    frame[19] = 0x00;
+    frame[20] = (ETH_P_AT >> 8) & 0xFF;
+    frame[21] = ETH_P_AT & 0xFF;
+    memcpy(frame + 22, ddp_packet, ddp_len);
+
+    frame_len = 22 + ddp_len;
+
+    /* Set up packet socket address */
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_802_2);
+    sll.sll_ifindex = ifindex;
+    sll.sll_halen = 6;
+    memcpy(sll.sll_addr, dest_hw, 6);
+
+    ret = sendto(fd, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll));
+    close(fd);
+    return ret;
+}
+
+/* Send RTMP broadcast using raw Ethernet frames (Linux AF_APPLETALK doesn't support broadcast properly) */
+static ssize_t sendto_iface_broadcast(struct interface *iface,
+                                       const void *buf, size_t len,
+                                       const struct sockaddr_at *dest_addr)
+{
+    int fd;
+    struct ifreq ifr;
+    unsigned char src_hw[6];
+    unsigned char dst_hw[6] = {0x09, 0x00, 0x07, 0xFF, 0xFF, 0xFF}; /* AppleTalk broadcast MAC */
+    unsigned char frame[1500];
+    unsigned char ddp_packet[1500];
+    int ddp_len;
+    uint16_t hop_len, llc_len;
+    int frame_len;
+    int ifindex;  /* Save ifindex before it gets clobbered by SIOCGIFHWADDR */
+    struct sockaddr_ll sll;
+    uint16_t src_net_host, dst_net_host;
+    int pos;
+    ssize_t ret;
+
+    /* Build DDP header + payload */
+    ddp_len = 13 + len - 1;  /* 13 byte DDP header + payload (minus DDP type byte already in buf) */
+    if (ddp_len > (int)sizeof(ddp_packet)) {
+        LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: packet too large");
+        return -1;
+    }
+
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_802_2));
+    if (fd < 0) {
+        LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: socket failed: %s", strerror(errno));
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface->i_name, sizeof(ifr.ifr_name) - 1);
+
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+        LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: SIOCGIFINDEX failed: %s (iface=%s)", 
+            strerror(errno), iface->i_name);
+        close(fd);
+        return -1;
+    }
+    
+    /* CRITICAL: Save ifindex before SIOCGIFHWADDR overwrites the union! */
+    ifindex = ifr.ifr_ifindex;
+    LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: got ifindex=%d", ifindex);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: SIOCGIFHWADDR failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    
+    LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: got hw addr %02x:%02x:%02x:%02x:%02x:%02x",
+        (unsigned char)ifr.ifr_hwaddr.sa_data[0], (unsigned char)ifr.ifr_hwaddr.sa_data[1],
+        (unsigned char)ifr.ifr_hwaddr.sa_data[2], (unsigned char)ifr.ifr_hwaddr.sa_data[3],
+        (unsigned char)ifr.ifr_hwaddr.sa_data[4], (unsigned char)ifr.ifr_hwaddr.sa_data[5]);
+
+    memcpy(src_hw, ifr.ifr_hwaddr.sa_data, sizeof(src_hw));
+
+    src_net_host = ntohs(iface->i_addr.sat_addr.s_net);
+    dst_net_host = ntohs(dest_addr->sat_addr.s_net);
+
+    /* Build extended DDP header */
+    pos = 0;
+    hop_len = (0 << 10) | (ddp_len & 0x3FF);
+    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;
+    ddp_packet[pos++] = hop_len & 0xFF;
+    ddp_packet[pos++] = 0x00;  /* checksum high */
+    ddp_packet[pos++] = 0x00;  /* checksum low */
+    ddp_packet[pos++] = (dst_net_host >> 8) & 0xFF;  /* dst_net high */
+    ddp_packet[pos++] = dst_net_host & 0xFF;         /* dst_net low */
+    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;  /* src_net high */
+    ddp_packet[pos++] = src_net_host & 0xFF;         /* src_net low */
+    ddp_packet[pos++] = dest_addr->sat_addr.s_node;  /* dst_node (255 for broadcast) */
+    ddp_packet[pos++] = iface->i_addr.sat_addr.s_node;  /* src_node */
+    ddp_packet[pos++] = dest_addr->sat_port;  /* dst_socket (RTMP = 1) */
+    ddp_packet[pos++] = dest_addr->sat_port;  /* src_socket */
+    /* DDP type already in payload buffer */
+
+    /* Copy payload (includes DDP type byte) */
+    memcpy(ddp_packet + pos, buf, len);
+
+    /* Build Ethernet frame with LLC/SNAP header */
+    memcpy(frame, dst_hw, 6);      /* Destination MAC */
+    memcpy(frame + 6, src_hw, 6);  /* Source MAC */
+    llc_len = htons((uint16_t)(8 + ddp_len));
+    memcpy(frame + 12, &llc_len, sizeof(llc_len));  /* 802.3 length */
+    frame[14] = 0xAA;  /* LLC DSAP */
+    frame[15] = 0xAA;  /* LLC SSAP */
+    frame[16] = 0x03;  /* LLC Control */
+    frame[17] = 0x00;  /* SNAP OUI[0] */
+    frame[18] = 0x00;  /* SNAP OUI[1] */
+    frame[19] = 0x00;  /* SNAP OUI[2] */
+    frame[20] = (ETH_P_AT >> 8) & 0xFF;  /* SNAP Type high (AppleTalk) */
+    frame[21] = ETH_P_AT & 0xFF;         /* SNAP Type low */
+    memcpy(frame + 22, ddp_packet, ddp_len);
+
+    frame_len = 22 + ddp_len;
+
+    /* Set up packet socket address */
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_802_2);
+    sll.sll_ifindex = ifindex;  /* Use saved ifindex, not ifr.ifr_ifindex (clobbered) */
+    sll.sll_halen = 6;
+    memcpy(sll.sll_addr, dst_hw, 6);
+
+    LOG(log_error, logtype_atalkd,
+        "sendto_iface_broadcast: RAW SOCKET sending %d bytes to %02x:%02x:%02x:%02x:%02x:%02x on %s (dest %u.%u) ifindex=%d",
+        frame_len, dst_hw[0], dst_hw[1], dst_hw[2], dst_hw[3], dst_hw[4], dst_hw[5],
+        iface->i_name, dst_net_host, dest_addr->sat_addr.s_node, sll.sll_ifindex);
+
+    ret = sendto(fd, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll));
+    if (ret < 0) {
+        LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: sendto failed: %s", strerror(errno));
+    } else {
+        LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: SUCCESS sent %zd bytes", ret);
+    }
+
+    close(fd);
+    return ret;
+}
+#endif
+
 static ssize_t sendto_iface(struct interface *iface, int sockfd,
                             const void *buf, size_t len,
                             const struct sockaddr_at *dest_addr)
 {
+    /* Use raw socket for broadcasts on Linux */
+#ifdef __linux__
+    if (dest_addr->sat_addr.s_node == ATADDR_BCAST) {
+        return sendto_iface_broadcast(iface, buf, len, dest_addr);
+    }
+#endif
+
+    LOG(log_error, logtype_atalkd,
+        "sendto_iface: interface=%s sockfd=%d len=%zu dest=%u.%u",
+        iface->i_name, sockfd, len,
+        ntohs(dest_addr->sat_addr.s_net),
+        dest_addr->sat_addr.s_node);
+
     ssize_t ret = sendto(sockfd, buf, len, 0, (struct sockaddr *)dest_addr,
                          sizeof(struct sockaddr_at));
+
+    LOG(log_error, logtype_atalkd,
+        "sendto_iface: sendto returned %zd (errno=%d %s)",
+        ret, errno, ret < 0 ? strerror(errno) : "success");
 
     if (ret < 0) {
         if (!(iface->i_flags & IFACE_ERROR)) {
@@ -179,6 +430,12 @@ static void as_timer(int sig _U_)
         if (iface->i_flags & IFACE_LOOPBACK) {
             continue;
         }
+        
+        LOG(log_error, logtype_atalkd,
+            "RTMP: Processing interface %s (flags=0x%x, RSEED=%s, ISROUTER=%s)",
+            iface->i_name, iface->i_flags,
+            (iface->i_flags & IFACE_RSEED) ? "YES" : "NO",
+            (iface->i_flags & IFACE_ISROUTER) ? "YES" : "NO");
 
         for (ap = iface->i_ports; ap; ap = ap->ap_next) {
             if (ap->ap_packet == zip_packet) {
@@ -534,7 +791,7 @@ static void as_timer(int sig _U_)
             sat.sat_len = sizeof(struct sockaddr_at);
 #endif /* BSD4_4 */
             sat.sat_family = AF_APPLETALK;
-            sat.sat_addr.s_net = ATADDR_ANYNET;
+            sat.sat_addr.s_net = iface->i_addr.sat_addr.s_net;
             sat.sat_addr.s_node = ATADDR_BCAST;
 
             if (rap == NULL) {
@@ -586,10 +843,18 @@ static void as_timer(int sig _U_)
                  * tuples because their distance will have the high bit set.
                  */
                 for (rtmp = iface2->i_rt; rtmp; rtmp = rtmp->rt_inext) {
+                    uint16_t net_first = ntohs(rtmp->rt_firstnet);
+                    uint16_t net_last = ntohs(rtmp->rt_lastnet);
+                    
                     /* don't broadcast routes we have no zone for */
                     if (rtmp->rt_zt == NULL ||
                             (rtmp->rt_flags & RTMPTAB_ZIPQUERY) ||
                             (rtmp->rt_flags & RTMPTAB_HASZONES) == 0) {
+                        if (rtmp->rt_flags & RTMPTAB_AURP) {
+                            LOG(log_error, logtype_atalkd,
+                                "RTMP BROADCAST SKIP: AURP route %u-%u zt=%p flags=0x%x (no zones)",
+                                net_first, net_last, rtmp->rt_zt, rtmp->rt_flags);
+                        }
                         continue;
                     }
 
@@ -607,6 +872,12 @@ static void as_timer(int sig _U_)
                         !(rtmp->rt_flags & RTMPTAB_AURP) &&
                         (rtmp->rt_iface == iface)) {
                         continue;
+                    }
+                    
+                    if (rtmp->rt_flags & RTMPTAB_AURP) {
+                        LOG(log_error, logtype_atalkd,
+                            "RTMP BROADCAST INCLUDE: AURP route %u-%u hops %u (will advertise)",
+                            net_first, net_last, rtmp->rt_hops);
                     }
 
                     if (((rtmp->rt_flags & RTMPTAB_EXTENDED) &&
@@ -646,6 +917,9 @@ static void as_timer(int sig _U_)
 
             /* send rest */
             if (n) {
+                LOG(log_error, logtype_atalkd,
+                    "RTMP: Sending %d routes to broadcast address from interface %s",
+                    n, iface->i_name);
                 sendto_iface(iface, rap->ap_fd, packet, data - packet, &sat);
             }
         }
