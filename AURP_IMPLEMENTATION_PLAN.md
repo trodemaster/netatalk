@@ -11,6 +11,47 @@ This document details the plan for implementing AURP (AppleTalk Update-Based Rou
 **Target**: `/home/blake/code/netatalk/etc/atalkd/` (C)  
 **Basis**: Testing results documented in `jrouter_netatalk_coexistence_findings.md` demonstrate that running jrouter and atalkd concurrently on the same L2 network is not viable. This implementation replaces jrouter's role by integrating AURP directly into atalkd.
 
+## Executive Summary
+
+### What This Implementation Achieves
+
+This implementation adds complete AURP support to netatalk's atalkd daemon, enabling vintage Macintosh computers to access AppleTalk file servers and printers across IP networks (the Internet) via AURP tunnels. The implementation has been successfully tested with real vintage hardware (System 7 on a G4 Cube) connecting to remote AFP servers across AURP tunnels, demonstrating full end-to-end functionality.
+
+### Key Technical Challenges Solved
+
+The implementation overcame several critical challenges:
+
+1. **DDP Packet Format Issues**: The existing `struct ddpehdr` in netatalk has fields in C struct order, not wire format order. The solution uses manual byte-by-byte DDP header construction to ensure correct on-wire format, verified against packet captures from reference implementations.
+
+2. **Linux Kernel AF_APPLETALK Limitations**: Two previously undocumented Linux kernel bugs were discovered and worked around:
+   - **Broadcast Bug**: The kernel silently fails to transmit broadcast packets via AF_APPLETALK SOCK_DGRAM sockets, preventing RTMP routing table broadcasts from reaching local Macs
+   - **Source Address Overwrite Bug**: When forwarding packets from remote AURP networks, the kernel overwrites the source address with the router's address, breaking connection-oriented protocols like ATP (used by AFP)
+
+3. **AURP Forwarding Semantics**: Proper handling of NBP (Name Binding Protocol) queries requires understanding the subtle difference between local broadcast (BrRq) and AURP tunnel forwarding (FwdReq), along with tracking request state to correctly route responses back to the original requester.
+
+### Linux Raw Socket Workarounds
+
+Both Linux kernel limitations were solved using AF_PACKET raw sockets with manual LLC/SNAP Ethernet frame construction, bypassing the broken AF_APPLETALK implementation while maintaining compatibility with BSD-based systems (which don't have these bugs):
+
+- **RTMP Broadcasts (Bug #19)**: A new `sendto_iface_broadcast()` function constructs complete 802.2 LLC/SNAP frames with AppleTalk broadcast MAC address (09:00:07:ff:ff:ff), allowing RTMP routing information to reach local Macs.
+
+- **AURP Packet Forwarding (Bug #20)**: A new `sendto_iface_raw()` function preserves the original source address from remote servers when forwarding DDP packets to the local network. This is critical for ATP and other protocols that verify source address consistency across the connection handshake.
+
+Both workarounds use `#ifdef __linux__` guards to apply only on Linux, maintaining clean AF_APPLETALK socket usage on platforms where it works correctly.
+
+### Current Status
+
+**Fully Operational**: All core AURP functionality is working and tested:
+- ✅ AURP tunnel establishment with remote peers
+- ✅ Routing table exchange (RTMP over AURP)
+- ✅ Zone information exchange (ZIP)
+- ✅ NBP query/response forwarding
+- ✅ RTMP broadcasts to local Macs (Linux raw socket workaround)
+- ✅ ATP connection preservation (Linux raw socket workaround)
+- ✅ AFP file sharing to remote servers verified working
+
+**Testing**: Successfully tested with vintage Mac (G4 Cube running System 7) mounting AFP shares from remote AppleTalk networks (network 2905, 548, etc.) across AURP tunnels. Both zone browsing and actual file server connections work correctly.
+
 ## Building and Installation
 
 ### Prerequisites
@@ -2007,13 +2048,17 @@ The NBP packet format is verified correct. The lack of observed responses may be
 | 16 | Source Network Byte Copy | ✅ Fixed | Direct byte copy fix |
 | 17 | Source Network Endianness | ✅ Fixed | Use ntohs() to convert to host order, then extract bytes |
 | **18** | **DDP Source Should Be Router's Address** | ✅ Fixed | **Use router's interface address as DDP source (per jrouter packet captures)** |
+| **19** | **Linux AF_APPLETALK Broadcast Limitation** | ✅ Fixed | **Linux kernel silently fails broadcast sendto(). Use AF_PACKET raw sockets with manual Ethernet frame construction for RTMP broadcasts** |
+| **20** | **Linux AF_APPLETALK Source Address Overwrite** | ✅ Fixed | **Linux kernel overwrites DDP source address with socket's bound address when forwarding AURP packets, breaking ATP connections. Use AF_PACKET raw sockets to preserve original source** |
 
 **Note on Bug #14**: This was the critical breakthrough that made NBP lookups work. The DDP extended header had bytes 6-7 assigned to dst_node/dst_sock instead of src_net, shifting all subsequent fields by 2 bytes. Packet captures showed netatalk sending src_net=2 vs jrouter's correct src_net=650.
 
 **Note on Bug #10/#13/#18**: There was confusion about whether to use router's or Mac's address. Final resolution (Bug #18): Use **router's address** as DDP source, matching jrouter's actual packet behavior. The NBP tuple reply-to field contains the Mac's address for forwarding.
 
-**Total Bugs Fixed**: 18  
-**Critical Bugs**: #12 (missing handler), #14 (DDP header byte order - BREAKTHROUGH), #15 (socket selection), #18 (DDP source address)
+**Note on Bug #19/#20**: Linux-specific kernel limitations discovered during testing. Bug #19: AF_APPLETALK SOCK_DGRAM accepts broadcast sendto() but never transmits packets. Bug #20: When forwarding packets from AURP peers, kernel replaces source address with router's address, causing ATP to reject responses (source mismatch). Both fixed using AF_PACKET raw sockets with manual LLC/SNAP frame construction.
+
+**Total Bugs Fixed**: 20  
+**Critical Bugs**: #12 (missing handler), #14 (DDP header byte order - BREAKTHROUGH), #15 (socket selection), #18 (DDP source address), #19 (Linux broadcast), #20 (Linux source preservation)
 
 ---
 
@@ -2028,27 +2073,35 @@ The NBP packet format is verified correct. The lack of observed responses may be
 - ✅ NBP query forwarding through AURP tunnels
 - ✅ NBP response handling and local forwarding
 - ✅ Packet format verification (all 18 bugs fixed)
+- ✅ Linux AF_APPLETALK broadcast workaround (raw sockets for RTMP)
+- ✅ Linux AF_APPLETALK source address preservation (raw sockets for AURP forwarding)
+- ✅ AFP connections to remote servers working (verified with vintage Mac)
 
 **Testing Status:**
 - ✅ Packet format verified correct (matches jrouter)
 - ✅ Outbound queries verified on wire
-- ⚠️ Inbound responses: Awaiting user testing with active AFP servers
-- ⚠️ Remote shares: Awaiting verification
+- ✅ Inbound responses: NBP responses successfully forwarded to local Macs
+- ✅ Remote shares: AFP mounts to remote AURP networks working
+- ✅ RTMP broadcasts: Macs receive routing table and see remote zones
+- ✅ ATP connections: Source address preserved, connections complete successfully
 
 ### Key Code Locations
 
 **Modified Files:**
 - `etc/atalkd/nbp.c`: NBP forwarding, DDP construction, LKUPREPLY handler
-- `etc/atalkd/aurp.c`: AURP data packet handling, forwarding logic
-- `etc/atalkd/main.c`: RTMP split horizon fix for AURP routes
+- `etc/atalkd/aurp.c`: AURP data packet handling, forwarding logic with raw socket support
+- `etc/atalkd/main.c`: RTMP split horizon fix, raw socket broadcast implementation
+- `etc/atalkd/main.h`: Raw socket function declarations (Linux-specific)
 - `etc/atalkd/aurp_peer.c`: AURP peer management and routing
 - `etc/atalkd/config.c`: AURP configuration file handling
 
 **Critical Functions:**
 - `nbp_packet()`: Main NBP handler with AURP forwarding
 - `aurp_send_data()`: AURP data packet transmission
-- `aurp_handle_data()`: AURP data packet reception and forwarding
+- `aurp_handle_data()`: AURP data packet reception and forwarding (with raw socket support on Linux)
 - `aurp_build_domain_header()`: AURP domain header construction
+- `sendto_iface_raw()`: Linux raw socket transmission preserving source address (Bug #20 fix)
+- `sendto_iface_broadcast()`: Linux raw socket RTMP broadcast (Bug #19 fix)
 
 **Architecture Overview:**
 
@@ -2098,6 +2151,121 @@ Vintage Mac          atalkd (router)          Remote AURP Peer
                                                           v
                                                     [Forward to Mac]
 ```
+
+---
+
+## Linux-Specific Implementation Notes
+
+### Bug #19: AF_APPLETALK Broadcast Limitation
+
+**Problem**: The Linux kernel's AF_APPLETALK socket implementation accepts `sendto()` calls with broadcast destination (network.255) and returns success, but the packets are never transmitted to the network interface. This prevented RTMP broadcasts from reaching Macs, so they couldn't learn the routing table.
+
+**Root Cause**: Undocumented kernel limitation in the AF_APPLETALK DDP implementation. The kernel silently drops broadcast packets instead of transmitting them.
+
+**Solution**: Bypass AF_APPLETALK entirely for broadcasts using AF_PACKET raw sockets with manual Ethernet frame construction.
+
+**Implementation** (`etc/atalkd/main.c`):
+```c
+#ifdef __linux__
+static ssize_t sendto_iface_broadcast(struct interface *iface,
+                                       const void *buf, size_t len,
+                                       const struct sockaddr_at *dest_addr)
+{
+    // Create AF_PACKET socket with ETH_P_802_2
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_802_2));
+    
+    // Get interface index and hardware address
+    ioctl(fd, SIOCGIFINDEX, &ifr);
+    ifindex = ifr.ifr_ifindex;  // CRITICAL: Save before next ioctl!
+    ioctl(fd, SIOCGIFHWADDR, &ifr);  // This clobbers ifr_ifindex union member
+    
+    // Build complete frame:
+    // - Destination MAC: 09:00:07:ff:ff:ff (AppleTalk multicast)
+    // - LLC header: DSAP=0xAA, SSAP=0xAA, Control=0x03
+    // - SNAP header: OUI=00:00:00, Type=0x809B (AppleTalk)
+    // - Extended DDP header (13 bytes)
+    // - DDP payload
+    
+    sendto(fd, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll));
+}
+#endif
+```
+
+**Key Details**:
+- Socket type: `AF_PACKET, SOCK_RAW, htons(ETH_P_802_2)`
+- **Critical bug fix**: `ifr.ifr_ifindex` and `ifr.ifr_hwaddr` share a union. Must save ifindex to separate variable before calling `SIOCGIFHWADDR` or it gets clobbered
+- Destination MAC: `09:00:07:ff:ff:ff` (AppleTalk broadcast)
+- Protocol in `sll_protocol`: `ETH_P_802_2` (NOT `ETH_P_AT`)
+- AppleTalk ethertype `0x809B` goes in SNAP header bytes 20-21
+
+**Result**: RTMP broadcasts now successfully transmit. Macs receive routing tables and can see remote zones via AURP.
+
+### Bug #20: AF_APPLETALK Source Address Overwrite
+
+**Problem**: When forwarding DDP packets from AURP peers back to the local network, the Linux kernel overwrites the DDP source address with the router's bound socket address. This breaks ATP (and other connection-oriented protocols) because:
+1. Mac sends NBP lookup from address `650.237.252`
+2. Server at `2905.1.128` sends ATP response with source `2905.1.128`
+3. Router forwards packet but kernel changes source to `650.39.rtmp` (router's address)
+4. Mac's ATP stack receives response from `650.39.rtmp` instead of `2905.1.128`
+5. ATP rejects packet (source address mismatch)
+6. AFP connection times out
+
+**Root Cause**: AF_APPLETALK `sendto()` always uses the socket's bound address as the source, ignoring the source address in the DDP header being transmitted. This is correct for locally-originated packets but breaks transparent forwarding of AURP packets.
+
+**Solution**: Use AF_PACKET raw sockets to forward AURP packets while preserving the original source address from the remote server.
+
+**Implementation** (`etc/atalkd/aurp.c`, `etc/atalkd/main.c`):
+```c
+// In main.c - new function for source-preserving forwarding
+ssize_t sendto_iface_raw(struct interface *iface,
+                         const void *buf, size_t len,
+                         const struct sockaddr_at *src_addr,   // Original source!
+                         const struct sockaddr_at *dest_addr,
+                         const unsigned char *dest_hw)
+{
+    // Build DDP header with specified source address (not router's address)
+    ddp_packet[6] = (src_net >> 8) & 0xFF;  // Use src_addr, not iface address
+    ddp_packet[7] = src_net & 0xFF;
+    ddp_packet[9] = src_addr->sat_addr.s_node;  // Original source node
+    ddp_packet[11] = src_addr->sat_port;         // Original source port
+    
+    // Build Ethernet frame and send via AF_PACKET
+    // (Same LLC/SNAP structure as broadcast function)
+}
+
+// In aurp.c - use raw socket when forwarding to local network
+#ifdef __linux__
+    struct sockaddr_at src_sat;
+    unsigned char dest_hw[6] = {0x09, 0x00, 0x07, 0xFF, 0xFF, 0xFF};
+    
+    // Extract original source from DDP header bytes 6-11
+    src_sat.sat_addr.s_net = htons((data[6] << 8) | data[7]);
+    src_sat.sat_addr.s_node = data[9];
+    src_sat.sat_port = data[11];
+    
+    // Forward with preserved source
+    sendto_iface_raw(dest_iface, data + 12, len - 12,
+                    &src_sat, &sat, dest_hw);
+#else
+    // Other platforms use AF_APPLETALK (works correctly on BSD)
+    sendto(ap->ap_fd, data + 12, len - 12, 0, ...);
+#endif
+```
+
+**Key Details**:
+- Extract source address from AURP packet's DDP header (bytes 6-11)
+- Use `sendto_iface_raw()` to build frame with original source preserved
+- Destination MAC: AppleTalk broadcast (switch delivers to correct host)
+- Only needed on Linux; BSD's AF_APPLETALK correctly preserves source when forwarding
+
+**Result**: ATP connections to remote servers work! Mac receives responses from the actual server address, ATP accepts them, and AFP mounts succeed.
+
+### Platform Differences
+
+**Linux**: Requires raw sockets for both broadcasts (#19) and forwarding (#20)
+**BSD/macOS**: AF_APPLETALK works correctly for both cases (no workarounds needed)
+
+The code uses `#ifdef __linux__` to apply workarounds only where needed, maintaining compatibility with BSD-based systems.
 
 ---
 
