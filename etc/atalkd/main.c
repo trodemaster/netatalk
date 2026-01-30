@@ -288,7 +288,7 @@ static ssize_t sendto_iface_broadcast(struct interface *iface,
     
     /* CRITICAL: Save ifindex before SIOCGIFHWADDR overwrites the union! */
     ifindex = ifr.ifr_ifindex;
-    LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: got ifindex=%d", ifindex);
+    LOG(log_debug, logtype_atalkd, "sendto_iface_broadcast: got ifindex=%d", ifindex);
 
     if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
         LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: SIOCGIFHWADDR failed: %s", strerror(errno));
@@ -296,7 +296,7 @@ static ssize_t sendto_iface_broadcast(struct interface *iface,
         return -1;
     }
     
-    LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: got hw addr %02x:%02x:%02x:%02x:%02x:%02x",
+    LOG(log_debug, logtype_atalkd, "sendto_iface_broadcast: got hw addr %02x:%02x:%02x:%02x:%02x:%02x",
         (unsigned char)ifr.ifr_hwaddr.sa_data[0], (unsigned char)ifr.ifr_hwaddr.sa_data[1],
         (unsigned char)ifr.ifr_hwaddr.sa_data[2], (unsigned char)ifr.ifr_hwaddr.sa_data[3],
         (unsigned char)ifr.ifr_hwaddr.sa_data[4], (unsigned char)ifr.ifr_hwaddr.sa_data[5]);
@@ -351,7 +351,7 @@ static ssize_t sendto_iface_broadcast(struct interface *iface,
     sll.sll_halen = 6;
     memcpy(sll.sll_addr, dst_hw, 6);
 
-    LOG(log_error, logtype_atalkd,
+    LOG(log_debug, logtype_atalkd,
         "sendto_iface_broadcast: RAW SOCKET sending %d bytes to %02x:%02x:%02x:%02x:%02x:%02x on %s (dest %u.%u) ifindex=%d",
         frame_len, dst_hw[0], dst_hw[1], dst_hw[2], dst_hw[3], dst_hw[4], dst_hw[5],
         iface->i_name, dst_net_host, dest_addr->sat_addr.s_node, sll.sll_ifindex);
@@ -360,7 +360,7 @@ static ssize_t sendto_iface_broadcast(struct interface *iface,
     if (ret < 0) {
         LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: sendto failed: %s", strerror(errno));
     } else {
-        LOG(log_error, logtype_atalkd, "sendto_iface_broadcast: SUCCESS sent %zd bytes", ret);
+        LOG(log_debug, logtype_atalkd, "sendto_iface_broadcast: SUCCESS sent %zd bytes", ret);
     }
 
     close(fd);
@@ -875,7 +875,7 @@ static void as_timer(int sig _U_)
                     }
                     
                     if (rtmp->rt_flags & RTMPTAB_AURP) {
-                        LOG(log_error, logtype_atalkd,
+                        LOG(log_debug, logtype_atalkd,
                             "RTMP BROADCAST INCLUDE: AURP route %u-%u hops %u (will advertise)",
                             net_first, net_last, rtmp->rt_hops);
                     }
@@ -1433,7 +1433,7 @@ int main(int ac, char **av)
     }
 
     set_processname(prog);
-    syslog_setup(log_debug, logtype_default, logoption_pid, logfacility_daemon);
+    syslog_setup(debug ? log_debug : log_info, logtype_default, logoption_pid, logfacility_daemon);
     LOG(log_info, logtype_atalkd, "restart (%s)", version);
     /*
      * Socket for use in routing ioctl()s. Can't add routes to our

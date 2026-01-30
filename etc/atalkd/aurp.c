@@ -681,7 +681,7 @@ void aurp_input(int fd)
         return;
     }
 
-    LOG(log_error, logtype_atalkd,
+    LOG(log_debug, logtype_atalkd,
         "*** AURP PACKET RECEIVED: %zd bytes from %s:%d ***",
         len, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
     aurp_hexdump("RECV", buf, len);
@@ -739,11 +739,7 @@ void aurp_input(int fd)
     p += 6;
     remaining -= 6;
 
-    LOG(log_error, logtype_atalkd,
-        "aurp_input: parsed domain header: version=0x%04x reserved=0x%04x pkt_type=0x%04x remaining=%d",
-        version, reserved, pkt_type, remaining);
-
-    LOG(log_error, logtype_atalkd,
+    LOG(log_debug, logtype_atalkd,
         "aurp_input: parsed domain header: version=0x%04x reserved=0x%04x pkt_type=0x%04x remaining=%d",
         version, reserved, pkt_type, remaining);
 
@@ -778,7 +774,7 @@ void aurp_input(int fd)
     /* Handle packet based on type */
     if (pkt_type == AURP_PKT_APPLETALK) {
         /* Encapsulated AppleTalk data packet */
-        LOG(log_error, logtype_atalkd,
+        LOG(log_debug, logtype_atalkd,
             "*** AURP DATA PACKET RECEIVED! from %s len=%d ***",
             inet_ntoa(peer_addr), remaining);
 
@@ -793,7 +789,7 @@ void aurp_input(int fd)
             uint16_t ddp_len = hop_len & 0x03FF;
             uint16_t dnet = (dp[4] << 8) | dp[5];
             uint16_t snet = (dp[6] << 8) | dp[7];
-            LOG(log_error, logtype_atalkd,
+            LOG(log_debug, logtype_atalkd,
                 "aurp_input: DDP %u.%u.%u -> %u.%u.%u proto=%u ddp_len=%u raw_len=%d",
                 snet, dp[9], dp[11],   /* src_net, src_node, src_socket */
                 dnet, dp[8], dp[10],   /* dst_net, dst_node, dst_socket */
@@ -842,7 +838,7 @@ void aurp_input(int fd)
     p += 8;
     remaining -= 8;
 
-    LOG(log_info, logtype_atalkd,
+    LOG(log_debug, logtype_atalkd,
         "aurp_input: %s from %s conn_id=%u seq=%u flags=0x%04x data_len=%d recv_state=%s send_state=%s",
         aurp_cmd_name(cmd), inet_ntoa(peer_addr), conn_id, seq, flags, remaining,
         aurp_recv_state_name(peer->ap_recv_state), aurp_send_state_name(peer->ap_send_state));
@@ -2647,7 +2643,7 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
                 "aurp_handle_data: sendto_iface_raw(%u.%u.%u) failed: %s",
                 dst_net, dst_node, dst_socket, strerror(errno));
         } else {
-            LOG(log_error, logtype_atalkd,
+            LOG(log_debug, logtype_atalkd,
                 "*** aurp_handle_data: RAW forwarded %u.%u.%u -> %u.%u.%u ***",
                 ntohs(src_sat.sat_addr.s_net), src_sat.sat_addr.s_node, src_sat.sat_port,
                 dst_net, dst_node, dst_socket);
