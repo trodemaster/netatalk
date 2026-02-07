@@ -885,6 +885,13 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
     /*FALL THROUGH*/
 
     case NBPOP_LKUP :
+        /* Log the lookup request */
+        LOG(log_info, logtype_atalkd,
+            "nbp lkup: '%.*s:%.*s@%.*s' from %u.%u.%u",
+            nn.nn_objlen, nn.nn_obj,
+            nn.nn_typelen, nn.nn_type,
+            nn.nn_zonelen, nn.nn_zone,
+            ntohs(from->sat_addr.s_net), from->sat_addr.s_node, from->sat_port);
 
         /* do not send replies from the loopback interface */
         if (ap->ap_iface->i_flags & IFACE_LOOPBACK) {
