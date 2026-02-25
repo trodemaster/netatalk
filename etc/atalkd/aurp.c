@@ -69,39 +69,60 @@ struct aurp_nbp_track {
     uint16_t src_net;
     uint8_t src_node;
     uint8_t src_socket;
+    int is_inbound;         /* 1 = inbound FwdReq (reply goes back via AURP) */
     time_t ts;
     int in_use;
 };
 
 static struct aurp_nbp_track aurp_nbp_track[AURP_NBP_TRACK_MAX];
 
-void aurp_track_nbp_request(uint8_t nbp_id, uint16_t src_net,
-                            uint8_t src_node, uint8_t src_socket)
+static int aurp_nbp_track_find_slot(uint8_t nbp_id)
 {
     int i;
     time_t now = time(NULL);
-    int slot = -1;
+    int free_slot = -1;
 
     for (i = 0; i < AURP_NBP_TRACK_MAX; i++) {
         if (aurp_nbp_track[i].in_use) {
             if ((now - aurp_nbp_track[i].ts) > AURP_NBP_TRACK_TTL) {
                 aurp_nbp_track[i].in_use = 0;
             } else if (aurp_nbp_track[i].nbp_id == nbp_id) {
-                slot = i;
-                break;
+                return i;
             }
         }
-        if (!aurp_nbp_track[i].in_use && slot == -1) {
-            slot = i;
+        if (!aurp_nbp_track[i].in_use && free_slot == -1) {
+            free_slot = i;
         }
     }
+    return free_slot;
+}
 
+void aurp_track_nbp_request(uint8_t nbp_id, uint16_t src_net,
+                            uint8_t src_node, uint8_t src_socket)
+{
+    int slot = aurp_nbp_track_find_slot(nbp_id);
     if (slot >= 0) {
         aurp_nbp_track[slot].nbp_id = nbp_id;
         aurp_nbp_track[slot].src_net = src_net;
         aurp_nbp_track[slot].src_node = src_node;
         aurp_nbp_track[slot].src_socket = src_socket;
-        aurp_nbp_track[slot].ts = now;
+        aurp_nbp_track[slot].is_inbound = 0;
+        aurp_nbp_track[slot].ts = time(NULL);
+        aurp_nbp_track[slot].in_use = 1;
+    }
+}
+
+void aurp_track_inbound_nbp_request(uint8_t nbp_id, uint16_t src_net,
+                                    uint8_t src_node, uint8_t src_socket)
+{
+    int slot = aurp_nbp_track_find_slot(nbp_id);
+    if (slot >= 0) {
+        aurp_nbp_track[slot].nbp_id = nbp_id;
+        aurp_nbp_track[slot].src_net = src_net;
+        aurp_nbp_track[slot].src_node = src_node;
+        aurp_nbp_track[slot].src_socket = src_socket;
+        aurp_nbp_track[slot].is_inbound = 1;
+        aurp_nbp_track[slot].ts = time(NULL);
         aurp_nbp_track[slot].in_use = 1;
     }
 }
@@ -128,7 +149,7 @@ int aurp_lookup_nbp_request(uint8_t nbp_id, struct sockaddr_at *sat)
             sat->sat_addr.s_net = htons(aurp_nbp_track[i].src_net);
             sat->sat_addr.s_node = aurp_nbp_track[i].src_node;
             sat->sat_port = aurp_nbp_track[i].src_socket;
-            return 1;
+            return aurp_nbp_track[i].is_inbound ? 2 : 1;
         }
     }
 
@@ -2293,6 +2314,36 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
             nh.nh_op = NBPOP_LKUP;
             memcpy(data + 13, &nh, SZ_NBPHDR);
 
+            /*
+             * Rewrite the tuple reply-to address to our local router so
+             * that LkUpReply packets from afpd are deliverable on the local
+             * network (the kernel has no route for the remote Mac's network).
+             * Track the original requester so we can forward the reply back
+             * through AURP when it arrives.
+             */
+            if (ddp_len >= 13 + SZ_NBPHDR + SZ_NBPTUPLE && dest_iface != NULL) {
+                unsigned char *tuple = (unsigned char *)data + 13 + SZ_NBPHDR;
+                uint16_t orig_net = (tuple[0] << 8) | tuple[1];
+                uint8_t  orig_node = tuple[2];
+                uint8_t  orig_socket = tuple[3];
+
+                uint16_t local_net = ntohs(dest_iface->i_addr.sat_addr.s_net);
+                uint8_t  local_node = dest_iface->i_addr.sat_addr.s_node;
+
+                aurp_track_inbound_nbp_request(nh.nh_id,
+                    orig_net, orig_node, orig_socket);
+
+                tuple[0] = (local_net >> 8) & 0xFF;
+                tuple[1] = local_net & 0xFF;
+                tuple[2] = local_node;
+                tuple[3] = 2;  /* NBP socket */
+
+                LOG(log_info, logtype_atalkd,
+                    "aurp_handle_data: rewrote tuple reply-to %u.%u.%u -> %u.%u.2 (id=%u)",
+                    orig_net, orig_node, orig_socket,
+                    local_net, local_node, nh.nh_id);
+            }
+
             /* Try to resolve the requested zone and ensure multicast is configured */
             if (ddp_len >= 13 + SZ_NBPHDR + SZ_NBPTUPLE + 1) {
                 unsigned char *nbp = (unsigned char *)data + 13;
@@ -2433,11 +2484,34 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
                 memset(&nh, 0, sizeof(nh));
             }
 
-            /* If this is an NBP FwdReq, convert to LkUp before broadcasting */
+            /* If this is an NBP FwdReq, convert to LkUp and rewrite tuple */
             if (ddp_len >= 13 + SZ_NBPHDR) {
                 if (nh.nh_op == NBPOP_FWD) {
                     nh.nh_op = NBPOP_LKUP;
                     memcpy(data + 13, &nh, SZ_NBPHDR);
+
+                    if (ddp_len >= 13 + SZ_NBPHDR + SZ_NBPTUPLE && dest_iface != NULL) {
+                        unsigned char *tuple = (unsigned char *)data + 13 + SZ_NBPHDR;
+                        uint16_t orig_net = (tuple[0] << 8) | tuple[1];
+                        uint8_t  orig_node = tuple[2];
+                        uint8_t  orig_socket = tuple[3];
+
+                        uint16_t local_net = ntohs(dest_iface->i_addr.sat_addr.s_net);
+                        uint8_t  local_node = dest_iface->i_addr.sat_addr.s_node;
+
+                        aurp_track_inbound_nbp_request(nh.nh_id,
+                            orig_net, orig_node, orig_socket);
+
+                        tuple[0] = (local_net >> 8) & 0xFF;
+                        tuple[1] = local_net & 0xFF;
+                        tuple[2] = local_node;
+                        tuple[3] = 2;
+
+                        LOG(log_info, logtype_atalkd,
+                            "aurp_handle_data: rewrote tuple reply-to %u.%u.%u -> %u.%u.2 (id=%u)",
+                            orig_net, orig_node, orig_socket,
+                            local_net, local_node, nh.nh_id);
+                    }
                 }
             }
 

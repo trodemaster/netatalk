@@ -1512,6 +1512,44 @@ int aurp_rtmp_add_route(struct aurp_peer *peer, uint16_t firstnet,
     return 0;
 }
 
+/*
+ * Remove a route from all zone table references (zt->zt_rt) and free
+ * the route's own zone list (rt->rt_zt).  Must be called before freeing
+ * the rtmptab to prevent dangling pointers in the zone table that cause
+ * SIGSEGV when NBP or ZIP later iterates zt->zt_rt.
+ */
+static void aurp_rtmp_cleanup_zones(struct rtmptab *rt)
+{
+    struct list *l, *lnext;
+    struct ziptab *zt;
+    struct list *zl, *zlnext;
+
+    for (l = rt->rt_zt; l != NULL; l = lnext) {
+        lnext = l->l_next;
+        zt = (struct ziptab *)l->l_data;
+
+        if (zt != NULL) {
+            for (zl = zt->zt_rt; zl != NULL; zl = zlnext) {
+                zlnext = zl->l_next;
+                if (zl->l_data == (void *)rt) {
+                    if (zl->l_prev != NULL) {
+                        zl->l_prev->l_next = zl->l_next;
+                    } else {
+                        zt->zt_rt = zl->l_next;
+                    }
+                    if (zl->l_next != NULL) {
+                        zl->l_next->l_prev = zl->l_prev;
+                    }
+                    free(zl);
+                    break;
+                }
+            }
+        }
+        free(l);
+    }
+    rt->rt_zt = NULL;
+}
+
 /* Remove specific route from peer */
 void aurp_rtmp_remove_route(struct aurp_peer *peer, uint16_t firstnet,
                             uint16_t lastnet)
@@ -1564,6 +1602,8 @@ void aurp_rtmp_remove_route(struct aurp_peer *peer, uint16_t firstnet,
         }
     }
 
+    aurp_rtmp_cleanup_zones(rt);
+
     LOG(log_info, logtype_atalkd,
         "aurp_rtmp_remove_route: removed %u-%u from %s",
         firstnet, lastnet, inet_ntoa(peer->ap_addr));
@@ -1599,7 +1639,7 @@ void aurp_rtmp_update_route(struct aurp_peer *peer, uint16_t firstnet,
 /* Delete all routes learned from peer */
 void aurp_rtmp_delete_routes(struct aurp_peer *peer)
 {
-    struct rtmptab *rt, *next;
+    struct rtmptab *rt, *next, *irt;
     int count = 0;
 
     if (peer == NULL) {
@@ -1608,6 +1648,33 @@ void aurp_rtmp_delete_routes(struct aurp_peer *peer)
 
     for (rt = peer->ap_routes; rt != NULL; rt = next) {
         next = rt->rt_next;
+
+        /* Must unlink from the interface's circular i_rt list before freeing.
+         * aurp_rtmp_add_route inserts into both lists; failing to remove from
+         * the interface list here leaves dangling pointers that cause SIGSEGV
+         * when the RTMP timer or ZIP/NBP code later iterates i_rt->rt_inext. */
+        if (rt->rt_iprev != NULL) {
+            if (rt->rt_iprev == rt) {
+                /* Only route in the circular list */
+                if (rt->rt_iface != NULL && rt->rt_iface->i_rt != NULL) {
+                    rt->rt_iface->i_rt->rt_inext = NULL;
+                }
+            } else {
+                /* Unlink from the circular list */
+                if (rt->rt_inext != NULL) {
+                    rt->rt_inext->rt_iprev = rt->rt_iprev;
+                }
+                rt->rt_iprev->rt_inext = rt->rt_inext;
+                if (rt->rt_iface != NULL && rt->rt_iface->i_rt != NULL) {
+                    irt = rt->rt_iface->i_rt;
+                    if (irt->rt_inext == rt) {
+                        irt->rt_inext = (rt->rt_inext != NULL) ? rt->rt_inext : NULL;
+                    }
+                }
+            }
+        }
+
+        aurp_rtmp_cleanup_zones(rt);
         free(rt);
         count++;
     }

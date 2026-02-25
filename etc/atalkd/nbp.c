@@ -1133,29 +1133,80 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
 
     case NBPOP_LKUPREPLY :
     case NBPOP_FWDREPLY :
+    {
         /*
-         * This is a Lookup Reply or Forward Reply, typically from a remote AFP
-         * server responding to our NBP FwdReq. The reply is addressed to us
-         * (the router) because we used our address as the DDP source in the FwdReq.
-         * 
-         * We need to forward this reply to the original requester (the Mac).
-         * The original requester's address was stored when we forwarded the request.
+         * LkUpReply arriving on our local socket. Two cases:
+         *   result==1: outbound tracking (we sent FwdReq to remote, reply came
+         *              back via AURP and aurp_handle_data forwarded to local net)
+         *              → deliver to local requester via sendto
+         *   result==2: inbound tracking (remote peer sent FwdReq to us, we
+         *              rewrote the tuple so afpd replied to us locally)
+         *              → build DDP packet and send reply back through AURP
          */
-        LOG(log_warning, logtype_atalkd,
+        struct sockaddr_at requester;
+        int result;
+
+        LOG(log_info, logtype_atalkd,
             "nbp_packet: NBP reply received (op=%u) from %u.%u.%u id=%u count=%u len=%d",
             nh.nh_op,
             ntohs(from->sat_addr.s_net), from->sat_addr.s_node, from->sat_port,
             nh.nh_id, nh.nh_cnt, len);
-        
-        /* Look up the original requester using the NBP ID */
-        struct sockaddr_at requester;
-        if (aurp_lookup_nbp_request(nh.nh_id, &requester) == 0) {
-            LOG(log_warning, logtype_atalkd,
-                "nbp_packet: forwarding reply id=%u to original requester %u.%u:%u",
-                nh.nh_id,
-                ntohs(requester.sat_addr.s_net), requester.sat_addr.s_node, requester.sat_port);
-            
-            /* Forward the reply to the original requester */
+
+        result = aurp_lookup_nbp_request(nh.nh_id, &requester);
+
+        if (result == 2) {
+            /* Inbound: forward LkUpReply back through AURP tunnel */
+            uint16_t req_net = ntohs(requester.sat_addr.s_net);
+            uint16_t src_net_h = ntohs(from->sat_addr.s_net);
+            unsigned char ddp_pkt[ATP_BUFSIZ];
+            uint16_t total_len = 13 + len;
+            int pos = 0;
+            uint16_t hop_len;
+
+            LOG(log_info, logtype_atalkd,
+                "nbp_packet: inbound reply id=%u → AURP tunnel to %u.%u.%u",
+                nh.nh_id, req_net, requester.sat_addr.s_node,
+                requester.sat_port);
+
+            if (total_len > sizeof(ddp_pkt)) {
+                LOG(log_error, logtype_atalkd,
+                    "nbp_packet: reply too large for AURP (%u bytes)", total_len);
+                break;
+            }
+
+            hop_len = (0 << 10) | (total_len & 0x3FF);
+            ddp_pkt[pos++] = (hop_len >> 8) & 0xFF;
+            ddp_pkt[pos++] = hop_len & 0xFF;
+            ddp_pkt[pos++] = 0x00;  /* checksum */
+            ddp_pkt[pos++] = 0x00;
+            ddp_pkt[pos++] = (req_net >> 8) & 0xFF;    /* dst net */
+            ddp_pkt[pos++] = req_net & 0xFF;
+            ddp_pkt[pos++] = (src_net_h >> 8) & 0xFF;  /* src net */
+            ddp_pkt[pos++] = src_net_h & 0xFF;
+            ddp_pkt[pos++] = requester.sat_addr.s_node; /* dst node */
+            ddp_pkt[pos++] = from->sat_addr.s_node;     /* src node */
+            ddp_pkt[pos++] = requester.sat_port;         /* dst socket */
+            ddp_pkt[pos++] = from->sat_port;             /* src socket */
+            ddp_pkt[pos++] = DDPTYPE_NBP;
+
+            memcpy(ddp_pkt + pos, nbpop, len);
+
+            if (aurp_send_data(req_net, (char *)ddp_pkt, total_len) < 0) {
+                LOG(log_error, logtype_atalkd,
+                    "nbp_packet: AURP send reply to net %u failed", req_net);
+            } else {
+                LOG(log_info, logtype_atalkd,
+                    "nbp_packet: forwarded LkUpReply via AURP to %u.%u.%u",
+                    req_net, requester.sat_addr.s_node,
+                    requester.sat_port);
+            }
+        } else if (result == 1) {
+            /* Outbound: forward to local requester */
+            LOG(log_info, logtype_atalkd,
+                "nbp_packet: forwarding reply id=%u to local requester %u.%u.%u",
+                nh.nh_id, ntohs(requester.sat_addr.s_net),
+                requester.sat_addr.s_node, requester.sat_port);
+
             if (sendto(ap->ap_fd, nbpop, len, 0,
                        (struct sockaddr *)&requester, sizeof(requester)) < 0) {
                 LOG(log_error, logtype_atalkd,
@@ -1167,6 +1218,7 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                 nh.nh_id);
         }
         break;
+    }
 
     default :
         LOG(log_info, logtype_atalkd, "nbp_packet: bad op (%d)", nh.nh_op);

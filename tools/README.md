@@ -100,6 +100,104 @@ python3 nbp_zone_scan.py --type Workstation
 
 ---
 
+### aurp_nbp_flow.py
+
+**Purpose**: Real-time AURP/NBP end-to-end flow analyzer. Parses `atalkd` and `netatalk` journal logs and reconstructs inbound NBP lookup events from remote AURP peers, showing every step of the reply path. The primary tool for debugging why remote users can or cannot see our AFP server in their Chooser.
+
+**Usage**:
+```bash
+python3 aurp_nbp_flow.py                    # last 2 hours (default)
+python3 aurp_nbp_flow.py -H 6              # last 6 hours
+python3 aurp_nbp_flow.py --since "1 hour ago"
+python3 aurp_nbp_flow.py --summary         # counts only, no per-event detail
+python3 aurp_nbp_flow.py --tail            # follow live (like tail -f)
+python3 aurp_nbp_flow.py --all             # show all NBP types, not just AFPServer
+python3 aurp_nbp_flow.py --verbose         # include peer connect/disconnect events
+```
+
+**Options**:
+- `-H, --hours <n>`: Look back N hours (default: 2)
+- `--since <time>`: journalctl-style time spec, e.g. `"30 minutes ago"` (overrides `--hours`)
+- `--tail`: Stream journal live, printing events as they complete (Ctrl-C to stop)
+- `--summary`: Print summary counts only without the per-event detail block
+- `--verbose`: Include AURP peer connect/disconnect events in the event log
+- `--all`: Show all inbound NBP lookup types, not only `AFPServer`
+
+**Flow steps tracked for each inbound FwdReq**:
+1. FwdReq received from remote AURP peer (peer IP, NBP id, original reply-to tuple)
+2. Tuple reply-to address rewritten to local router address
+3. LkUp broadcast on local Ethernet segment
+4. LkUpReply received from `afpd`
+5. Reply forwarded back through AURP tunnel to original requester
+
+**Outcome codes**:
+- `✓ FORWARDED` — complete round trip succeeded; remote user should see the server
+- `✗ DROPPED (no tracked request)` — reply arrived but tracking entry was missing
+- `? LKUP BROADCAST, no reply` — `afpd` didn't respond (likely NBP registration gap after atalkd restart)
+- `? INCOMPLETE` — log window ended before the lookup resolved
+
+**Summary section reports**:
+- Inbound FwdReq count and AFPServer-specific count
+- Reply forwarded / dropped counts
+- Outbound BrRq count (local Mac scanning remote zones)
+- AURP peer connection and route counts
+- SEGV crashes, atalkd/netatalk restarts, AFPServer re-registrations
+
+**Exit codes** (useful for scripting/monitoring):
+- `0` — healthy
+- `1` — one or more SEGV crashes detected
+- `2` — AFPServer lookups received but zero replies forwarded (broken reply path)
+
+**Example output**:
+```
+════════════════════════════════════════════════════════════
+  AURP/NBP Flow Summary  —  last 2.0h
+════════════════════════════════════════════════════════════
+
+  Inbound NBP lookups from remote peers:
+    Total FwdReq received:        17
+    For AFPServer:                 9
+    Replies forwarded via AURP:    9  ✓
+    Replies dropped:               0
+
+  Health:
+    SEGV crashes:                  0
+    atalkd restarts:               0
+    netatalk restarts:             0
+    AFPServer re-registrations:    1
+════════════════════════════════════════════════════════════
+
+  Event log:
+  Feb 25 21:28:15  ℹ NBP: AFPServer registered at 650.41:128 zone=netjibbing
+  Feb 25 21:30:02  =:AFPServer@netjibbing (+4 retries)
+    peer=71.74.97.148  orig_tuple=9315.50.254
+    → tuple rewritten to 650.41.2
+    → LkUp broadcast on local net
+    → LkUpReply received from afpd
+    ✓ FORWARDED
+```
+
+**When to use**:
+- After a code change, run `python3 aurp_nbp_flow.py --since "5 minutes ago"` immediately after TalkScanner's next sweep to see if the reply path worked
+- Run `--tail` during live debugging sessions to see events in real time
+- Run `--summary` as a quick health check (scriptable, exit code signals problems)
+- Run `-H 24` the morning after an overnight soak test to see the full picture
+
+---
+
+### nbp_scan_monitor.py
+
+**Purpose**: Shows detailed information about recent NBP lookups and scans seen on the local AppleTalk network. Filters to highlight external (non-local) scans. See `NBP_SCAN_MONITOR.md` for full documentation.
+
+**Usage**:
+```bash
+python3 nbp_scan_monitor.py [options]
+```
+
+**Quick reference**: external scans by zone, object, and source address; complements `aurp_nbp_flow.py` (which focuses on the inbound AURP→local reply path).
+
+---
+
 ### aurp_packet_compare.py
 
 **Purpose**: Compares AURP packets between two pcap captures byte-by-byte to identify protocol differences. Essential for debugging when comparing netatalk behavior against a reference implementation like jrouter.
@@ -502,6 +600,25 @@ This single command:
    ```
 
 ### Monitoring AURP Activity
+
+**Log-based (no capture required — preferred for ongoing monitoring)**:
+
+```bash
+# Quick health snapshot — last 2 hours
+python3 aurp_nbp_flow.py
+
+# Summary only, suitable for scripting
+python3 aurp_nbp_flow.py --summary
+echo "Exit: $?"   # 0=healthy, 1=crash, 2=broken reply path
+
+# Live follow — see events as they happen (TalkScanner sweeps arrive hourly)
+python3 aurp_nbp_flow.py --tail
+
+# Morning-after soak test review
+python3 aurp_nbp_flow.py -H 12 --summary
+```
+
+**Packet-capture based (when you need raw byte-level detail)**:
 
 1. Start a capture in background:
    ```bash
