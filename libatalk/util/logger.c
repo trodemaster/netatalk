@@ -480,17 +480,14 @@ void make_log_entry(enum loglevels loglevel, enum logtypes logtype,
 
     if (type_configs[logtype].syslog) {
         if (type_configs[logtype].level >= loglevel) {
-            /* Initialise the Messages and send it to syslog */
             va_start(args, message);
             len = vasprintf(&user_message, message, args);
             va_end(args);
 
-            if (len == -1) {
-                return;
+            if (len != -1) {
+                make_syslog_entry(loglevel, logtype, user_message);
+                free(user_message);
             }
-
-            make_syslog_entry(loglevel, logtype, user_message);
-            free(user_message);
         }
 
         inlog = 0;

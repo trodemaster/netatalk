@@ -431,7 +431,7 @@ static void as_timer(int sig _U_)
             continue;
         }
         
-        LOG(log_error, logtype_atalkd,
+        LOG(log_debug, logtype_atalkd,
             "RTMP: Processing interface %s (flags=0x%x, RSEED=%s, ISROUTER=%s)",
             iface->i_name, iface->i_flags,
             (iface->i_flags & IFACE_RSEED) ? "YES" : "NO",
@@ -917,7 +917,7 @@ static void as_timer(int sig _U_)
 
             /* send rest */
             if (n) {
-                LOG(log_error, logtype_atalkd,
+                LOG(log_debug, logtype_atalkd,
                     "RTMP: Sending %d routes to broadcast address from interface %s",
                     n, iface->i_name);
                 sendto_iface(iface, rap->ap_fd, packet, data - packet, &sat);

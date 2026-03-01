@@ -1162,7 +1162,7 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
         /* Skip unconfigured interfaces */
         if ((iface->i_flags & IFACE_CONFIG) == 0) {
             skipped_unconfig++;
-            LOG(log_error, logtype_atalkd,
+            LOG(log_debug, logtype_atalkd,
                 "aurp_send_ri_rsp: skipping unconfigured interface (flags=0x%x)",
                 iface->i_flags);
             continue;
@@ -1206,15 +1206,15 @@ int aurp_send_ri_rsp(struct aurp_peer *peer, int last)
             buf[len++] = 0x00;  /* Reserved */
         }
 
-        LOG(log_error, logtype_atalkd,
+        LOG(log_debug, logtype_atalkd,
             "aurp_send_ri_rsp: adding network %u-%u dist %u (extended=%d)",
             firstnet, lastnet, dist, is_extended);
         added_count++;
     }
     
-    LOG(log_error, logtype_atalkd,
-        "aurp_send_ri_rsp: checked %d interfaces, skipped %d unconfig, %d loopback, added %d networks",
-        iface_count, skipped_unconfig, skipped_loopback, added_count);
+    LOG(log_info, logtype_atalkd,
+        "aurp_send_ri_rsp: %d interfaces, added %d networks",
+        iface_count, added_count);
 
     /* Send packet */
     if (aurp_send_packet(peer, buf, len) < 0) {
@@ -1718,6 +1718,22 @@ done:
  * Data Forwarding Functions
  */
 
+/* Persistent AF_PACKET socket fd shared across all raw send/recv operations.
+ * Opening and closing an AF_PACKET socket per-send causes synchronize_rcu()
+ * D-state hangs (packet_release → synchronize_rcu) under frequent access.
+ * This fd is initialised once by aurp_raw_init() and reused forever. */
+static int g_raw_fd = -1;
+
+void aurp_set_raw_fd(int fd)
+{
+    g_raw_fd = fd;
+}
+
+int aurp_get_raw_fd(void)
+{
+    return g_raw_fd;
+}
+
 int aurp_raw_init(void)
 {
 #ifdef __linux__
@@ -1738,6 +1754,7 @@ int aurp_raw_init(void)
     }
 #endif
 
+    g_raw_fd = fd;
     return fd;
 #else
     return -1;
@@ -1833,28 +1850,26 @@ static int aurp_send_zone_multicast(struct interface *iface,
     struct sockaddr_ll sll;
     uint16_t llc_len;
     unsigned char *p = frame;
-    int fd;
     int frame_len;
 
     if (ddp_len <= 0 || ddp_len > 1400) {
         return -1;
     }
 
-    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_802_2));
-    if (fd < 0) {
+    /* Use the persistent raw fd — never open/close per-send to avoid
+     * synchronize_rcu() D-state hangs in packet_release(). */
+    if (g_raw_fd < 0) {
         return -1;
     }
 
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, iface->i_name, sizeof(ifr.ifr_name) - 1);
 
-    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
-        close(fd);
+    if (ioctl(g_raw_fd, SIOCGIFINDEX, &ifr) < 0) {
         return -1;
     }
 
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
-        close(fd);
+    if (ioctl(g_raw_fd, SIOCGIFHWADDR, &ifr) < 0) {
         return -1;
     }
 
@@ -1890,12 +1905,10 @@ static int aurp_send_zone_multicast(struct interface *iface,
     sll.sll_halen = 6;
     memcpy(sll.sll_addr, dst_hw, 6);
 
-    if (sendto(fd, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
-        close(fd);
+    if (sendto(g_raw_fd, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
         return -1;
     }
 
-    close(fd);
     return 0;
 }
 #endif
@@ -1948,51 +1961,34 @@ struct aurp_peer *aurp_find_peer_for_net(uint16_t net)
     int peer_count = 0;
     int route_count = 0;
 
-    LOG(log_error, logtype_atalkd,
-        "DEBUG PEER FIND: Looking for peer serving network %u", net);
+    LOG(log_debug, logtype_atalkd,
+        "aurp_find_peer_for_net: looking for network %u", net);
 
     for (peer = aurp_config.ac_peers; peer != NULL; peer = peer->ap_next) {
         peer_count++;
         
-        /* Only consider connected peers (CONNECTED or WAIT_TICKLE_ACK) */
         if (peer->ap_recv_state != AURP_RECV_CONNECTED && 
             peer->ap_recv_state != AURP_RECV_WAIT_TICKLE_ACK) {
-            LOG(log_error, logtype_atalkd,
-                "DEBUG PEER FIND: Peer %s not connected (state=%d)",
-                inet_ntoa(peer->ap_addr), peer->ap_recv_state);
             continue;
         }
 
-        LOG(log_error, logtype_atalkd,
-            "DEBUG PEER FIND: Checking connected peer %s",
-            inet_ntoa(peer->ap_addr));
-
-        /* Search through routes learned from this peer */
         route_count = 0;
         for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
             uint16_t firstnet = ntohs(rt->rt_firstnet);
             uint16_t lastnet = ntohs(rt->rt_lastnet);
             route_count++;
 
-            LOG(log_error, logtype_atalkd,
-                "DEBUG PEER FIND:   Route %u-%u (checking if %u in range)",
-                firstnet, lastnet, net);
-
             if (net >= firstnet && net <= lastnet) {
-                LOG(log_error, logtype_atalkd,
-                    "DEBUG PEER FIND: MATCH! Returning peer %s",
-                    inet_ntoa(peer->ap_addr));
+                LOG(log_debug, logtype_atalkd,
+                    "aurp_find_peer_for_net: net %u -> peer %s (route %u-%u)",
+                    net, inet_ntoa(peer->ap_addr), firstnet, lastnet);
                 return peer;
             }
         }
-        
-        LOG(log_error, logtype_atalkd,
-            "DEBUG PEER FIND: Peer %s has %d routes, none matched",
-            inet_ntoa(peer->ap_addr), route_count);
     }
 
-    LOG(log_error, logtype_atalkd,
-        "DEBUG PEER FIND: No peer found for network %u (checked %d peers)",
+    LOG(log_warning, logtype_atalkd,
+        "aurp_find_peer_for_net: no peer for network %u (checked %d peers)",
         net, peer_count);
 
     return NULL;
@@ -2013,8 +2009,8 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
     uint8_t dst_node, src_node, dst_socket;
     int ddp_len;
 
-    LOG(log_error, logtype_atalkd,
-        "*** aurp_handle_data: ENTRY - peer=%s len=%d ***",
+    LOG(log_debug, logtype_atalkd,
+        "aurp_handle_data: peer=%s len=%d",
         inet_ntoa(peer->ap_addr), len);
 
     /* Need at least the DDP header (12 bytes) + type (1 byte) */
@@ -2025,27 +2021,27 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
     }
 
     /* Parse DDP extended header manually.
-     * DDP Extended Header format (13 bytes):
-     *   Bytes 0-1: Hop count (4 bits) + Length (10 bits)
-     *   Bytes 2-3: Checksum
-     *   Bytes 4-5: Destination Network
-     *   Bytes 6-7: Source Network
-     *   Byte 8:    Destination Node
-     *   Byte 9:    Source Node
-     *   Byte 10:   Destination Socket
-     *   Byte 11:   Source Socket
-     *   Byte 12:   DDP Type
+     * DDP Extended Header wire format (13 bytes) — verified against jrouter captures:
+     *   Bytes 0-1: Hop count (4 bits, bits 13-10) + Length (10 bits, bits 9-0)
+     *   Bytes 2-3: Checksum (0x0000 = no checksum)
+     *   Bytes 4-5: Destination Network (big-endian)
+     *   Byte  6:   Destination Node
+     *   Byte  7:   Destination Socket
+     *   Bytes 8-9: Source Network (big-endian)
+     *   Byte  10:  Source Node
+     *   Byte  11:  Source Socket
+     *   Byte  12:  DDP Type
      */
     unsigned char *p = (unsigned char *)data;
     uint16_t hop_len = (p[0] << 8) | p[1];
     uint16_t checksum = (p[2] << 8) | p[3];
     ddp_len = hop_len & 0x3FF;
     
-    dst_net = (p[4] << 8) | p[5];
-    src_net = (p[6] << 8) | p[7];
-    dst_node = p[8];
-    src_node = p[9];
-    dst_socket = p[10];
+    dst_net    = (p[4] << 8) | p[5];
+    dst_node   = p[6];
+    dst_socket = p[7];
+    src_net    = (p[8] << 8) | p[9];
+    src_node   = p[10];
     /* src_socket = p[11]; */
     if (ddp_len < 13 || ddp_len > len) {
         LOG(log_warning, logtype_atalkd,
@@ -2064,12 +2060,12 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         }
     }
 
-    LOG(log_error, logtype_atalkd,
-        "aurp_handle_data: DDP %u.%u.%u -> %u.%u.%u len=%d",
-        src_net, src_node, p[11],  /* src_socket */
-        dst_net, dst_node, dst_socket, ddp_len);
+    LOG(log_debug, logtype_atalkd,
+        "aurp_handle_data: DDP %u.%u.%u -> %u.%u.%u type=0x%02x len=%d",
+        src_net, src_node, p[11],
+        dst_net, dst_node, dst_socket, (uint8_t)p[12], ddp_len);
 
-    /* If NBP, log basic tuple details to confirm replies arriving */
+    /* Log NBP details at info level for scan tracking */
     if (p[12] == DDPTYPE_NBP) {
         int nbp_len = ddp_len - 13;
         if (nbp_len >= SZ_NBPHDR) {
@@ -2080,16 +2076,7 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
 
             if (nbp_len >= SZ_NBPHDR + SZ_NBPTUPLE) {
                 memcpy(&nt, nbp + SZ_NBPHDR, SZ_NBPTUPLE);
-                LOG(log_error, logtype_atalkd,
-                    "aurp_handle_data: NBP op=%u cnt=%u id=%u tuple=%u.%u.%u",
-                    nh.nh_op, nh.nh_cnt, nh.nh_id,
-                    ntohs(nt.nt_net), nt.nt_node, nt.nt_port);
 
-                LOG(log_error, logtype_atalkd,
-                    "aurp_handle_data: NBP op=%u dst_socket=%u dst=%u.%u src=%u.%u",
-                    nh.nh_op, dst_socket, dst_net, dst_node, src_net, src_node);
-
-                /* Best-effort parse of NBP strings (object/type/zone) */
                 unsigned char *q = nbp + SZ_NBPHDR + SZ_NBPTUPLE;
                 unsigned char *nbp_end = nbp + nbp_len;
                 if (q < nbp_end) {
@@ -2106,50 +2093,30 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
                                     unsigned char zonelen = *q++;
                                     unsigned char *zone = q;
                                     if (q + zonelen <= nbp_end) {
-                                        LOG(log_error, logtype_atalkd,
-                                            "aurp_handle_data: NBP names obj='%.*s' type='%.*s' zone='%.*s'",
+                                        LOG(log_info, logtype_atalkd,
+                                            "aurp_handle_data: NBP op=%u id=%u '%.*s:%.*s@%.*s' tuple=%u.%u.%u",
+                                            nh.nh_op, nh.nh_id,
                                             objlen, (char *)obj,
                                             typelen, (char *)typ,
-                                            zonelen, (char *)zone);
+                                            zonelen, (char *)zone,
+                                            ntohs(nt.nt_net), nt.nt_node, nt.nt_port);
                                     }
                                 }
                             }
                         }
                     }
                 }
-            } else {
-                LOG(log_error, logtype_atalkd,
-                    "aurp_handle_data: NBP op=%u cnt=%u id=%u (no tuple)",
-                    nh.nh_op, nh.nh_cnt, nh.nh_id);
             }
-        } else {
-            LOG(log_error, logtype_atalkd,
-                "aurp_handle_data: NBP packet too short (%d bytes)", nbp_len);
         }
     }
-    
-    /* DEBUG: Show raw DDP header bytes and full packet hex */
-    LOG(log_error, logtype_atalkd,
-        "DEBUG INCOMING DDP: bytes[4-7]=%02x%02x %02x %02x (dst_net.node.socket) bytes[8-11]=%02x%02x %02x %02x (src_net.node.socket)",
-        p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]);
-    
-    /* DEBUG: Show full DDP packet hex */
-    char hex_buf[256];
-    int hex_pos = 0;
-    for (int i = 0; i < (ddp_len < 40 ? ddp_len : 40); i++) {
-        hex_pos += sprintf(hex_buf + hex_pos, "%02x ", (unsigned char)p[i]);
-    }
-    LOG(log_error, logtype_atalkd,
-        "DEBUG INCOMING FULL HEX (first %d bytes): %s",
-        (ddp_len < 40 ? ddp_len : 40), hex_buf);
 
     /*
      * Find the local interface for this network.
      * If dst_net is 0, it means "this network"; use the first configured
      * non-loopback interface.
      */
-    LOG(log_error, logtype_atalkd,
-        "DEBUG IFACE: Looking for local interface for dest network %u", dst_net);
+    LOG(log_debug, logtype_atalkd,
+        "aurp_handle_data: finding interface for dest network %u", dst_net);
 
     if (dst_net == 0) {
         for (iface = interfaces; iface != NULL; iface = iface->i_next) {
@@ -2167,49 +2134,32 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         }
     } else {
         for (iface = interfaces; iface != NULL; iface = iface->i_next) {
-        LOG(log_error, logtype_atalkd,
-            "DEBUG IFACE: Checking %s: flags=0x%x", iface->i_name, iface->i_flags);
-        
-        if ((iface->i_flags & IFACE_CONFIG) == 0) {
-            LOG(log_error, logtype_atalkd,
-                "DEBUG IFACE: %s not configured", iface->i_name);
-            if ((iface->i_flags & IFACE_LOOPBACK) != 0) {
+            if ((iface->i_flags & IFACE_CONFIG) == 0) {
+                if ((iface->i_flags & IFACE_LOOPBACK) != 0) {
+                    continue;
+                }
+                if (iface->i_rt != NULL) {
+                    uint16_t firstnet = ntohs(iface->i_rt->rt_firstnet);
+                    uint16_t lastnet = ntohs(iface->i_rt->rt_lastnet);
+                    if (dst_net >= firstnet && dst_net <= lastnet) {
+                        dest_iface = iface;
+                        break;
+                    }
+                }
                 continue;
             }
-            if (iface->i_rt != NULL) {
-                uint16_t firstnet = ntohs(iface->i_rt->rt_firstnet);
-                uint16_t lastnet = ntohs(iface->i_rt->rt_lastnet);
-                if (dst_net >= firstnet && dst_net <= lastnet) {
-                    dest_iface = iface;
-                    LOG(log_error, logtype_atalkd,
-                        "DEBUG IFACE: using %s without IFACE_CONFIG", iface->i_name);
-                    break;
-                }
+            if (iface->i_flags & IFACE_LOOPBACK) {
+                continue;
             }
-            continue;
-        }
-        if (iface->i_flags & IFACE_LOOPBACK) {
-            LOG(log_error, logtype_atalkd,
-                "DEBUG IFACE: %s is loopback", iface->i_name);
-            continue;
-        }
-        if (iface->i_rt == NULL) {
-            LOG(log_error, logtype_atalkd,
-                "DEBUG IFACE: %s has NULL route!", iface->i_name);
-            continue;
-        }
+            if (iface->i_rt == NULL) {
+                continue;
+            }
 
-        uint16_t firstnet = ntohs(iface->i_rt->rt_firstnet);
-        uint16_t lastnet = ntohs(iface->i_rt->rt_lastnet);
-
-        LOG(log_error, logtype_atalkd,
-            "DEBUG IFACE: %s range %u-%u (checking if %u in range)", 
-            iface->i_name, firstnet, lastnet, dst_net);
+            uint16_t firstnet = ntohs(iface->i_rt->rt_firstnet);
+            uint16_t lastnet = ntohs(iface->i_rt->rt_lastnet);
 
             if (dst_net >= firstnet && dst_net <= lastnet) {
                 dest_iface = iface;
-                LOG(log_error, logtype_atalkd,
-                    "DEBUG IFACE: MATCHED! Using %s", iface->i_name);
                 break;
             }
         }
@@ -2230,8 +2180,8 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
         struct nbphdr nh;
         memcpy(&nh, data + 13, SZ_NBPHDR);
 
-        LOG(log_error, logtype_atalkd,
-            "aurp_handle_data: NBP packet received! op=%u id=%u count=%u",
+        LOG(log_debug, logtype_atalkd,
+            "aurp_handle_data: NBP packet op=%u id=%u count=%u",
             nh.nh_op, nh.nh_id, nh.nh_cnt);
 
         if (nh.nh_op == NBPOP_LKUPREPLY || nh.nh_op == NBPOP_FWDREPLY) {
@@ -2239,15 +2189,12 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
             struct interface *reply_iface = NULL;
             uint16_t reply_net;
 
-            LOG(log_error, logtype_atalkd,
-                "aurp_handle_data: Got NBP REPLY (op=%u)! Looking up tracked request for id=%u",
-                nh.nh_op, nh.nh_id);
-
             if (aurp_lookup_nbp_request(nh.nh_id, &reply_dest)) {
                 reply_net = ntohs(reply_dest.sat_addr.s_net);
                 
-                LOG(log_error, logtype_atalkd,
-                    "aurp_handle_data: Found tracked request! Reply should go to %u.%u.%u",
+                LOG(log_info, logtype_atalkd,
+                    "aurp_handle_data: NBP reply (op=%u id=%u) → deliver to %u.%u.%u",
+                    nh.nh_op, nh.nh_id,
                     reply_net, reply_dest.sat_addr.s_node, reply_dest.sat_port);
                 for (iface = interfaces; iface != NULL; iface = iface->i_next) {
                     if ((iface->i_flags & IFACE_CONFIG) == 0 || iface->i_rt == NULL) {
@@ -2272,9 +2219,9 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
                     }
 
                     if (ap != NULL) {
-                        LOG(log_error, logtype_atalkd,
-                            "aurp_handle_data: tracked NBP reply using iface=%s port=%u -> %u.%u.%u",
-                            reply_iface->i_name, ap->ap_port,
+                        LOG(log_info, logtype_atalkd,
+                            "aurp_handle_data: delivering NBP reply via %s to %u.%u.%u",
+                            reply_iface->i_name,
                             reply_net, reply_dest.sat_addr.s_node,
                             reply_dest.sat_port);
                         if (sendto(ap->ap_fd, data + 12, len - 12, 0,
@@ -2449,7 +2396,7 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
             }
 
             if (ap != NULL) {
-                LOG(log_error, logtype_atalkd,
+                LOG(log_info, logtype_atalkd,
                     "aurp_handle_data: broadcast FwdReq as LkUp iface=%s port=%u -> %u.%u.%u",
                     dest_iface->i_name, ap->ap_port, 0, ATADDR_BCAST, 2);
                 if (sendto(ap->ap_fd, data + 12, len - 12, 0,
@@ -2730,14 +2677,9 @@ static void aurp_handle_data(struct aurp_peer *peer, char *data, int len)
             "aurp_handle_data: sendto(%u.%u.%u) failed: %s",
             dst_net, dst_node, dst_socket, strerror(errno));
     } else {
-        LOG(log_error, logtype_atalkd,
-            "*** aurp_handle_data: forwarded packet to %u.%u.%u (via socket %d) ***",
-            dst_net, dst_node, dst_socket, ap->ap_port);
-        if ((uint8_t)data[12] == DDPTYPE_NBP) {
-            LOG(log_error, logtype_atalkd,
-                "aurp_handle_data: NBP forward iface=%s port=%u -> %u.%u.%u",
-                dest_iface->i_name, ap->ap_port, dst_net, dst_node, dst_socket);
-        }
+        LOG(log_debug, logtype_atalkd,
+            "aurp_handle_data: forwarded to %u.%u.%u via %s",
+            dst_net, dst_node, dst_socket, dest_iface->i_name);
     }
 #endif
 }
@@ -2785,25 +2727,25 @@ int aurp_send_data(uint16_t dst_net, char *ddp_data, int ddp_len)
     memcpy(buf + len, ddp_data, ddp_len);
     len += ddp_len;
 
-    /* Log key DDP header fields for AURP data sends */
+    /* Log key DDP extended header fields for AURP data sends.
+     * DDP extended: [0-1] hop+len, [2-3] cksum, [4-5] dst_net,
+     * [6-7] src_net, [8] dst_node, [9] src_node, [10] dst_sock, [11] src_sock, [12] type */
     if (ddp_len >= 13) {
         unsigned char *p = (unsigned char *)ddp_data;
-        uint16_t hop_len = (p[0] << 8) | p[1];
-        uint16_t checksum = (p[2] << 8) | p[3];
-        uint16_t dst_net = (p[4] << 8) | p[5];
-        uint8_t dst_node = p[6];
-        uint8_t dst_socket = p[7];
-        uint16_t src_net = (p[8] << 8) | p[9];
-        uint8_t src_node = p[10];
-        uint8_t src_socket = p[11];
+        uint16_t ddp_dst_net = (p[4] << 8) | p[5];
+        uint16_t ddp_src_net = (p[6] << 8) | p[7];
+        uint8_t ddp_dst_node = p[8];
+        uint8_t ddp_src_node = p[9];
+        uint8_t ddp_dst_sock = p[10];
+        uint8_t ddp_src_sock = p[11];
         uint8_t ddp_type = p[12];
 
-        LOG(log_warning, logtype_atalkd,
-            "aurp_send_data: peer %s DDP %u.%u.%u -> %u.%u.%u type=0x%02x len=%u cksum=0x%04x",
-            peer ? inet_ntoa(peer->ap_addr) : "?",
-            src_net, src_node, src_socket,
-            dst_net, dst_node, dst_socket,
-            ddp_type, hop_len & 0x3FF, checksum);
+        LOG(log_info, logtype_atalkd,
+            "aurp_send_data: peer %s DDP %u.%u.%u -> %u.%u.%u type=0x%02x",
+            inet_ntoa(peer->ap_addr),
+            ddp_src_net, ddp_src_node, ddp_src_sock,
+            ddp_dst_net, ddp_dst_node, ddp_dst_sock,
+            ddp_type);
     }
 
     /* DEBUG: Log packet hex for analysis */

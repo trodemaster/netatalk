@@ -45,9 +45,9 @@ start_services() {
 cleanup() {
     if [[ $BUILD_FAILED -ne 0 ]]; then
         echo ""
-        echo "Build/install failed — restoring configs from backup and restarting services..."
-        sudo cp /tmp/afp.conf.bak    /etc/netatalk/afp.conf    2>/dev/null || true
-        sudo cp /tmp/atalkd.conf.bak /etc/netatalk/atalkd.conf 2>/dev/null || true
+        echo "Build/install failed — restoring configs from repo and restarting services..."
+        sudo cp "$CUSTOM_CFG_DIR/afp.conf"    /etc/netatalk/afp.conf    2>/dev/null || true
+        sudo cp "$CUSTOM_CFG_DIR/atalkd.conf" /etc/netatalk/atalkd.conf 2>/dev/null || true
     fi
     start_services
 }
@@ -55,21 +55,14 @@ trap cleanup EXIT
 
 stop_services
 
-# ── back up live configs ──────────────────────────────────────────────────────
-echo "Backing up /etc/netatalk configs..."
-sudo cp -p /etc/netatalk/afp.conf    /tmp/afp.conf.bak
-sudo cp -p /etc/netatalk/atalkd.conf /tmp/atalkd.conf.bak
-
 # ── build & install ───────────────────────────────────────────────────────────
 echo "Building..."
 meson compile -C "$BUILD_DIR" || { BUILD_FAILED=1; exit 1; }
 echo "Installing..."
 sudo meson install -C "$BUILD_DIR" || { BUILD_FAILED=1; exit 1; }
 
-# ── restore custom configs ────────────────────────────────────────────────────
+# ── restore custom configs from canonical repo copies ────────────────────────
+# config/throwback/ is the source of truth; meson install overwrites /etc/netatalk/
 echo "Restoring custom configs..."
-sudo cp /tmp/afp.conf.bak    /etc/netatalk/afp.conf
-sudo cp /tmp/atalkd.conf.bak /etc/netatalk/atalkd.conf
-# Keep repo copies in sync
-cp /tmp/afp.conf.bak    "$CUSTOM_CFG_DIR/afp.conf"
-cp /tmp/atalkd.conf.bak "$CUSTOM_CFG_DIR/atalkd.conf"
+sudo cp "$CUSTOM_CFG_DIR/afp.conf"    /etc/netatalk/afp.conf
+sudo cp "$CUSTOM_CFG_DIR/atalkd.conf" /etc/netatalk/atalkd.conf

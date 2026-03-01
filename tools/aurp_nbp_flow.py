@@ -91,6 +91,7 @@ class InboundLookup:
     reply_forwarded: bool = False
     reply_dropped: bool = False
     ts: str = ''
+    ts_epoch: float = 0.0
     retries: int = 0
 
     def outcome(self):
@@ -129,8 +130,25 @@ class Stats:
 
 # ── log fetching ──────────────────────────────────────────────────────────────
 
+def normalize_since(s: str) -> str:
+    """Convert shorthand like '4h', '15min', '2h30m' to journalctl-compatible form.
+
+    journalctl understands '-4h', '-15min', 'X hours ago', etc.
+    It does NOT understand bare '4h' or '15min' without a leading '-'.
+    """
+    s = s.strip()
+    # Already a proper absolute timestamp or relative with '-' or 'ago'
+    if not s or s.startswith('-') or 'ago' in s or ':' in s:
+        return s
+    # Convert bare shorthand: digits followed by h/m/min/s → prepend '-'
+    if re.match(r'^\d+[hHmMsS]', s):
+        return f"-{s}"
+    return s
+
+
 def fetch_logs(since: str, units: list[str]) -> list[str]:
     lines = []
+    since = normalize_since(since)
     for unit in units:
         cmd = ['journalctl', '-u', unit, '--since', since, '--no-pager', '-o', 'short']
         try:
@@ -402,30 +420,168 @@ def print_events(lookups: list, health_events: list, afpserver_only: bool, summa
 
 
 def live_tail(since: str, afpserver_only: bool):
-    """Stream journal lines in real time and print events as they complete."""
-    print(f"{CYAN}Tailing atalkd/netatalk logs (Ctrl-C to stop)...{RESET}\n")
+    """
+    Stream journal lines in real time, printing each lookup's progress
+    step-by-step as the log lines arrive.  Maintains persistent state
+    across lines so multi-step events are correlated correctly.
+    """
+    import time as _time
+
+    print(f"{CYAN}Tailing atalkd/netatalk logs (Ctrl-C to stop)...{RESET}\n",
+          flush=True)
     cmd = ['journalctl', '-u', 'atalkd', '-u', 'netatalk',
            '--since', since, '--no-pager', '-f', '-o', 'short']
-    pending: list[str] = []
+
+    # Persistent state across log lines
+    active: dict[int, InboundLookup] = {}
+    printed: set[int] = set()       # nbp_ids whose header line has been emitted
+    current_peer: Optional[str] = None
+    EXPIRE_SECS = 45                # report incomplete lookup after this silence
+
+    def _expire_stale():
+        now = _time.time()
+        stale = [nid for nid, lk in active.items()
+                 if (now - lk.ts_epoch) > EXPIRE_SECS]
+        for nid in stale:
+            lk = active.pop(nid)
+            if nid in printed:
+                print(f"    {color_outcome(lk.outcome())}\n", flush=True)
+            elif lk.obj and (not afpserver_only or lk.is_afpserver()):
+                name = f"{lk.obj}:{lk.type_}@{lk.zone}"
+                print(f"{DIM}{lk.ts}{RESET}  {BOLD}▶ {name}{RESET}  peer={lk.peer_ip}")
+                print(f"    orig_tuple={lk.orig_tuple}")
+                print(f"    {color_outcome(lk.outcome())}\n", flush=True)
+
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
         for raw in proc.stdout:
             raw = raw.rstrip()
-            pending.append(raw)
-            # Re-parse the growing buffer periodically
-            lookups, health, stats = parse_logs(pending, verbose=False)
-            # Print newly completed items
-            for lk in lookups:
-                if afpserver_only and not lk.is_afpserver():
-                    continue
-                outcome = lk.outcome()
-                if lk.reply_forwarded or lk.reply_dropped:
-                    name = f"{lk.obj}:{lk.type_}@{lk.zone}" if lk.obj else f"id={lk.nbp_id}"
-                    print(f"{DIM}{lk.ts}{RESET}  {BOLD}{name}{RESET}  {color_outcome(outcome)}")
-            for ts, desc in health:
-                color = RED if ('CRASH' in desc or 'SEGV' in desc) else CYAN
-                print(f"{DIM}{ts}{RESET}  {color}⚡ {desc}{RESET}")
-            pending.clear()
+            _expire_stale()
+
+            m = LOG_RE.match(raw)
+            if not m:
+                continue
+            ts, unit, msg = m.group(1), m.group(2), m.group(3)
+
+            # ── Health events — print immediately ────────────────────────────
+            if PATTERNS['atalkd_segv'].search(msg):
+                print(f"{DIM}{ts}{RESET}  {RED}⚡ CRASH: atalkd SEGV / core-dump{RESET}",
+                      flush=True)
+                for lk in active.values():
+                    lk.reply_dropped = True
+                active.clear()
+                continue
+
+            if PATTERNS['atalkd_restart'].search(msg) and unit == 'atalkd':
+                print(f"{DIM}{ts}{RESET}  {CYAN}⚡ RESTART: atalkd restarted{RESET}",
+                      flush=True)
+                active.clear()
+                printed.clear()
+                continue
+
+            if m2 := PATTERNS['afp_started'].search(msg):
+                print(f"{DIM}{ts}{RESET}  {CYAN}ℹ AFPServer registered"
+                      f" at {m2.group(2)} zone={m2.group(1)}{RESET}", flush=True)
+                continue
+
+            # ── Track current peer from ENTRY lines ──────────────────────────
+            if m2 := PATTERNS['fwdreq_peer'].search(msg):
+                current_peer = m2.group(1)
+
+            # ── Step 1: FwdReq received ──────────────────────────────────────
+            if m2 := PATTERNS['fwdreq_entry'].search(msg):
+                nbp_id = int(m2.group(1))
+                now = _time.time()
+                if nbp_id not in active:
+                    active[nbp_id] = InboundLookup(
+                        nbp_id=nbp_id,
+                        peer_ip=current_peer or '?',
+                        orig_tuple=m2.group(2),
+                        ts=ts,
+                        ts_epoch=now,
+                    )
+                else:
+                    active[nbp_id].retries += 1
+                    active[nbp_id].ts_epoch = now
+                continue
+
+            # ── Step 1b: NBP names (obj/type/zone) ───────────────────────────
+            if m2 := PATTERNS['fwdreq_names'].search(msg):
+                for lk in reversed(list(active.values())):
+                    if lk.peer_ip == current_peer and not lk.obj:
+                        lk.obj   = m2.group(1)
+                        lk.type_ = m2.group(2)
+                        lk.zone  = m2.group(3)
+                        lk.ts_epoch = _time.time()
+                        if afpserver_only and not lk.is_afpserver():
+                            break
+                        retry_note = f" (+{lk.retries} retries)" if lk.retries else ""
+                        name = f"{lk.obj}:{lk.type_}@{lk.zone}"
+                        print(f"{DIM}{ts}{RESET}  {BOLD}▶ {name}{RESET}{retry_note}"
+                              f"  peer={lk.peer_ip}", flush=True)
+                        printed.add(lk.nbp_id)
+                        break
+                continue
+
+            # ── Step 2: Tuple reply-to rewritten ─────────────────────────────
+            if m2 := PATTERNS['tuple_rewrite'].search(msg):
+                nbp_id = int(m2.group(3))
+                if nbp_id in active:
+                    lk = active[nbp_id]
+                    lk.ts_epoch = _time.time()
+                    if not lk.rewritten_to:
+                        lk.rewritten_to = m2.group(2)
+                        if nbp_id in printed:
+                            print(f"    → tuple rewritten: {m2.group(1)} → {m2.group(2)}",
+                                  flush=True)
+                continue
+
+            # ── Step 3: LkUp broadcast ───────────────────────────────────────
+            if PATTERNS['lkup_broadcast'].search(msg):
+                for lk in reversed(list(active.values())):
+                    if lk.peer_ip == current_peer and lk.rewritten_to:
+                        lk.ts_epoch = _time.time()
+                        if not lk.lkup_broadcast:
+                            lk.lkup_broadcast = True
+                            if lk.nbp_id in printed:
+                                print(f"    → LkUp broadcast on local net", flush=True)
+                        break
+                continue
+
+            # ── Step 4: LkUpReply received (inbound tracking) ────────────────
+            if m2 := PATTERNS['reply_inbound'].search(msg):
+                nbp_id = int(m2.group(1))
+                if nbp_id in active:
+                    active[nbp_id].reply_received = True
+                    active[nbp_id].ts_epoch = _time.time()
+                    if nbp_id in printed:
+                        print(f"    → LkUpReply received from afpd", flush=True)
+                continue
+
+            # ── Step 5: Reply forwarded via AURP ─────────────────────────────
+            if PATTERNS['reply_forwarded'].search(msg):
+                for lk in reversed(list(active.values())):
+                    if lk.reply_received and not lk.reply_forwarded:
+                        lk.reply_forwarded = True
+                        if lk.nbp_id in printed:
+                            print(f"    {color_outcome(lk.outcome())}\n", flush=True)
+                        active.pop(lk.nbp_id, None)
+                        printed.discard(lk.nbp_id)
+                        break
+                continue
+
+            # ── Reply dropped (no tracking entry) ────────────────────────────
+            if m2 := PATTERNS['reply_dropped'].search(msg):
+                nbp_id = int(m2.group(1))
+                if nbp_id in active:
+                    active[nbp_id].reply_dropped = True
+                    if nbp_id in printed:
+                        print(f"    {color_outcome(active[nbp_id].outcome())}\n",
+                              flush=True)
+                    active.pop(nbp_id, None)
+                    printed.discard(nbp_id)
+                continue
+
     except KeyboardInterrupt:
         print("\nStopped.")
 
@@ -451,9 +607,11 @@ def main():
     args = parser.parse_args()
 
     if args.since:
-        window = args.since
+        window = normalize_since(args.since)
+        label = args.since   # display the original user-supplied value
     else:
         window = f"{args.hours} hours ago"
+        label = f"last {args.hours}h"
 
     afpserver_only = not args.all_types
 
@@ -464,10 +622,8 @@ def main():
     lines = fetch_logs(window, ['atalkd', 'netatalk'])
     lookups, health_events, stats = parse_logs(lines, verbose=args.verbose)
 
-    label = f"last {args.hours}h" if not args.since else args.since
     print_summary(stats, label)
 
-    # Filter lookups for display
     display = [lk for lk in lookups if (not afpserver_only or lk.is_afpserver())]
     # Show most recent first
     display.sort(key=lambda x: x.ts, reverse=True)

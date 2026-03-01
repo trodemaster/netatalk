@@ -226,6 +226,10 @@ int aurp_lookup_nbp_request(uint8_t nbp_id, struct sockaddr_at *sat);
 /* Raw EtherTalk capture for local->AURP forwarding (Linux only) */
 int aurp_raw_init(void);
 void aurp_raw_input(int fd);
+/* Shared persistent AF_PACKET fd — avoids per-send open/close and the
+ * synchronize_rcu() D-state hang that packet_release() causes. */
+void aurp_set_raw_fd(int fd);
+int  aurp_get_raw_fd(void);
 int aurp_send_zi_req(struct aurp_peer *peer, uint16_t *nets, int count);
 int aurp_send_zi_rsp(struct aurp_peer *peer, int last);
 int aurp_send_zi_rsp_for_nets(struct aurp_peer *peer, const uint16_t *nets, int count);

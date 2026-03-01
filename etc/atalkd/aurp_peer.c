@@ -368,7 +368,7 @@ void aurp_peer_connect(struct aurp_peer *peer)
         return;
     }
 
-    LOG(log_error, logtype_atalkd, "*** aurp_peer_connect: CALLED for %s ***",
+    LOG(log_info, logtype_atalkd, "aurp_peer_connect: connecting to %s",
         inet_ntoa(peer->ap_addr));
 
     /* Set state */
@@ -379,12 +379,11 @@ void aurp_peer_connect(struct aurp_peer *peer)
     peer->ap_send_retries = 0;
     peer->ap_tickle_retries = 0;
 
-    /* Send Open-Req */
-    LOG(log_error, logtype_atalkd, "*** Calling aurp_send_open_req for %s ***",
-        inet_ntoa(peer->ap_addr));
     int result = aurp_send_open_req(peer);
-    LOG(log_error, logtype_atalkd, "*** aurp_send_open_req returned %d for %s ***",
-        result, inet_ntoa(peer->ap_addr));
+    if (result < 0) {
+        LOG(log_warning, logtype_atalkd, "aurp_peer_connect: open_req to %s failed",
+            inet_ntoa(peer->ap_addr));
+    }
 }
 
 /* Disconnect from peer */
@@ -425,8 +424,8 @@ void aurp_timer(void)
     time_t now = time(NULL);
     static time_t last_status_log = 0;
 
-    /* Log status summary every 60 seconds for debugging */
-    if (now - last_status_log >= 60) {
+    /* Log status summary every 10 minutes */
+    if (now - last_status_log >= 600) {
         aurp_log_status();
         last_status_log = now;
     }
@@ -571,13 +570,10 @@ void aurp_log_status(void)
     int peer_count = 0, connected_count = 0;
     int total_routes = 0, total_zones = 0;
 
-    LOG(log_info, logtype_atalkd, "=== AURP Status Summary ===");
-
     for (peer = aurp_config.ac_peers; peer != NULL; peer = peer->ap_next) {
         int route_count = 0, zone_count = 0;
         peer_count++;
 
-        /* Count routes and zones for this peer */
         for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
             route_count++;
             for (l = rt->rt_zt; l != NULL; l = l->l_next) {
@@ -591,34 +587,11 @@ void aurp_log_status(void)
             peer->ap_recv_state == AURP_RECV_WAIT_TICKLE_ACK) {
             connected_count++;
         }
-
-        LOG(log_info, logtype_atalkd,
-            "  Peer %s: recv=%s send=%s routes=%d zones=%d conn_id=%u",
-            inet_ntoa(peer->ap_addr),
-            get_recv_state_name(peer->ap_recv_state),
-            get_send_state_name(peer->ap_send_state),
-            route_count, zone_count, peer->ap_local_conn_id);
-
-        /* Log routes learned from this peer at debug level */
-        for (rt = peer->ap_routes; rt != NULL; rt = rt->rt_next) {
-            uint16_t firstnet = ntohs(rt->rt_firstnet);
-            uint16_t lastnet = ntohs(rt->rt_lastnet);
-
-            LOG(log_debug, logtype_atalkd,
-                "    Route %u-%u hops=%u flags=0x%x",
-                firstnet, lastnet, rt->rt_hops, rt->rt_flags);
-
-            /* Log zones for this route */
-            for (l = rt->rt_zt; l != NULL; l = l->l_next) {
-                zt = (struct ziptab *)l->l_data;
-                LOG(log_debug, logtype_atalkd,
-                    "      Zone: '%.*s'", zt->zt_len, zt->zt_name);
-            }
-        }
     }
 
+    /* Log summary only - per-peer detail at debug level */
     LOG(log_info, logtype_atalkd,
-        "=== AURP Totals: %d peers (%d connected), %d routes, %d zones ===",
+        "AURP: %d peers (%d connected), %d routes, %d zones",
         peer_count, connected_count, total_routes, total_zones);
 }
 
@@ -888,8 +861,8 @@ void aurp_handle_ri_rsp(struct aurp_peer *peer, char *data, int len)
 /* Handle RI-Ack */
 void aurp_handle_ri_ack(struct aurp_peer *peer, char *data, int len)
 {
-    LOG(log_error, logtype_atalkd, "aurp_handle_ri_ack: from %s flags=0x%04x SZI=%d",
-        inet_ntoa(peer->ap_addr), peer->ap_last_recv_flags,
+    LOG(log_info, logtype_atalkd, "aurp_handle_ri_ack: from %s SZI=%d",
+        inet_ntoa(peer->ap_addr),
         !!(peer->ap_last_recv_flags & AURP_FLAG_SZI));
 
     /* Clear pending retransmission */
@@ -1331,8 +1304,8 @@ void aurp_handle_zi_rsp(struct aurp_peer *peer, char *data, int len)
 
         if (peer->ap_recv_state == AURP_RECV_WAIT_ZI_RSP) {
             peer->ap_recv_state = AURP_RECV_CONNECTED;
-            LOG(log_error, logtype_atalkd,
-                "*** RECV_CONNECTED: bidirectional connection with %s fully established (with zones) ***",
+            LOG(log_info, logtype_atalkd,
+                "aurp: connected to %s (with zones)",
                 inet_ntoa(peer->ap_addr));
         }
     } else {

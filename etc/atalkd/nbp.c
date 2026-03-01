@@ -65,7 +65,7 @@ static int nbp_send_zone_multicast(struct interface *iface,
     uint16_t hop_len;
     int ddp_len;
     int frame_len;
-    int fd;
+    int raw_fd;
     int pos;
 
     if (nbp_len <= 0 || nbp_len > 1400) {
@@ -77,21 +77,21 @@ static int nbp_send_zone_multicast(struct interface *iface,
         return -1;
     }
 
-    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_802_2));
-    if (fd < 0) {
+    /* Use the persistent AF_PACKET fd — never open/close per-send to avoid
+     * synchronize_rcu() D-state hangs in packet_release(). */
+    raw_fd = aurp_get_raw_fd();
+    if (raw_fd < 0) {
         return -1;
     }
 
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, iface->i_name, sizeof(ifr.ifr_name) - 1);
 
-    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
-        close(fd);
+    if (ioctl(raw_fd, SIOCGIFINDEX, &ifr) < 0) {
         return -1;
     }
 
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
-        close(fd);
+    if (ioctl(raw_fd, SIOCGIFHWADDR, &ifr) < 0) {
         return -1;
     }
 
@@ -100,32 +100,32 @@ static int nbp_send_zone_multicast(struct interface *iface,
     src_net_host = ntohs(iface->i_addr.sat_addr.s_net);
 
     /* Build extended DDP header.
-     * DDP Extended Header format (13 bytes):
+     * DDP Extended Header wire format (13 bytes) — verified vs jrouter captures:
      *   [0-1]  hop (4 bits) + length (10 bits)
      *   [2-3]  checksum
      *   [4-5]  destination network
-     *   [6-7]  source network
-     *   [8]    destination node
-     *   [9]    source node
-     *   [10]   destination socket
+     *   [6]    destination node
+     *   [7]    destination socket
+     *   [8-9]  source network
+     *   [10]   source node
      *   [11]   source socket
      *   [12]   DDP type
      */
     pos = 0;
     hop_len = (0 << 10) | (ddp_len & 0x3FF);
-    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;  /* Byte 0: hop/len high */
-    ddp_packet[pos++] = hop_len & 0xFF;         /* Byte 1: hop/len low */
-    ddp_packet[pos++] = 0x00;                   /* Byte 2: checksum high */
-    ddp_packet[pos++] = 0x00;                   /* Byte 3: checksum low */
-    ddp_packet[pos++] = 0x00;                   /* Byte 4: dst_net high (net 0 = local) */
-    ddp_packet[pos++] = 0x00;                   /* Byte 5: dst_net low */
-    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;  /* Byte 6: src_net high */
-    ddp_packet[pos++] = src_net_host & 0xFF;         /* Byte 7: src_net low */
-    ddp_packet[pos++] = ATADDR_BCAST;           /* Byte 8: dst_node (broadcast) */
-    ddp_packet[pos++] = iface->i_addr.sat_addr.s_node;  /* Byte 9: src_node */
-    ddp_packet[pos++] = 2;                      /* Byte 10: dst_socket (NBP = 2) */
-    ddp_packet[pos++] = 2;                      /* Byte 11: src_socket (NBP = 2) */
-    ddp_packet[pos++] = DDPTYPE_NBP;            /* Byte 12: DDP type */
+    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;           /* Byte 0: hop/len high */
+    ddp_packet[pos++] = hop_len & 0xFF;                  /* Byte 1: hop/len low */
+    ddp_packet[pos++] = 0x00;                            /* Byte 2: checksum high */
+    ddp_packet[pos++] = 0x00;                            /* Byte 3: checksum low */
+    ddp_packet[pos++] = 0x00;                            /* Byte 4: dst_net high (net 0 = local) */
+    ddp_packet[pos++] = 0x00;                            /* Byte 5: dst_net low */
+    ddp_packet[pos++] = ATADDR_BCAST;                    /* Byte 6: dst_node (broadcast) */
+    ddp_packet[pos++] = 2;                               /* Byte 7: dst_socket (NBP = 2) */
+    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;     /* Byte 8: src_net high */
+    ddp_packet[pos++] = src_net_host & 0xFF;             /* Byte 9: src_net low */
+    ddp_packet[pos++] = iface->i_addr.sat_addr.s_node;  /* Byte 10: src_node */
+    ddp_packet[pos++] = 2;                               /* Byte 11: src_socket (NBP = 2) */
+    ddp_packet[pos++] = DDPTYPE_NBP;                     /* Byte 12: DDP type */
 
     memcpy(ddp_packet + pos, nbp_payload, nbp_len);
 
@@ -152,12 +152,10 @@ static int nbp_send_zone_multicast(struct interface *iface,
     sll.sll_halen = 6;
     memcpy(sll.sll_addr, dst_hw, 6);
 
-    if (sendto(fd, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
-        close(fd);
+    if (sendto(raw_fd, frame, frame_len, 0, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
         return -1;
     }
 
-    close(fd);
     return 0;
 }
 #endif
@@ -202,6 +200,115 @@ void nbp_ack(int fd, int nh_op, int nh_id, struct sockaddr_at *to)
         LOG(log_error, logtype_atalkd, "sendto: %s", strerror(errno));
     }
 }
+
+/*
+ * Send a LkUpReply packet.  If the destination matches a tracked inbound
+ * AURP request, forward the reply directly through the AURP tunnel instead
+ * of sending it via a DDP socket (which would require kernel DDP loopback
+ * and can trigger a D-state hang).
+ *
+ * Returns: 0 on success, -1 on error.
+ */
+static int nbp_send_lkupreply(struct atport *ap,
+                               const unsigned char *packet, int cc,
+                               const struct sockaddr_at *dest,
+                               const struct nbphdr *nh)
+{
+    struct sockaddr_at aurp_dest;
+    int result;
+
+    result = aurp_lookup_nbp_request(nh->nh_id, &aurp_dest);
+
+    if (result == 2) {
+        /* Inbound AURP request — forward directly through the tunnel.
+         * Build a DDP-extended header + NBP payload and hand it to
+         * aurp_send_data() so it reaches the original remote Mac.
+         * Use our own interface address as the DDP source. */
+        uint16_t req_net  = ntohs(aurp_dest.sat_addr.s_net);
+        uint16_t our_net  = ntohs(ap->ap_iface->i_addr.sat_addr.s_net);
+        uint8_t  our_node = ap->ap_iface->i_addr.sat_addr.s_node;
+        unsigned char ddp_pkt[ATP_BUFSIZ];
+        /* cc includes the 1-byte ddp-type prefix; NBP payload is cc-1 */
+        uint16_t total_len = 13 + (cc - 1);
+        int pos = 0;
+        uint16_t hop_len;
+
+        if (total_len > sizeof(ddp_pkt)) {
+            LOG(log_error, logtype_atalkd,
+                "nbp_send_lkupreply: reply too large for AURP (%u bytes)",
+                total_len);
+            return -1;
+        }
+
+        hop_len = (0 << 10) | (total_len & 0x3FF);
+        ddp_pkt[pos++] = (hop_len >> 8) & 0xFF;
+        ddp_pkt[pos++] = hop_len & 0xFF;
+        ddp_pkt[pos++] = 0x00;  /* checksum */
+        ddp_pkt[pos++] = 0x00;
+        /* DDP extended header wire format: dst_net, dst_node, dst_socket,
+         * src_net, src_node, src_socket (verified vs jrouter captures). */
+        ddp_pkt[pos++] = (req_net >> 8) & 0xFF;      /* dst net */
+        ddp_pkt[pos++] = req_net & 0xFF;
+        ddp_pkt[pos++] = aurp_dest.sat_addr.s_node;   /* dst node */
+        ddp_pkt[pos++] = aurp_dest.sat_port;           /* dst socket */
+        ddp_pkt[pos++] = (our_net >> 8) & 0xFF;       /* src net (our router) */
+        ddp_pkt[pos++] = our_net & 0xFF;
+        ddp_pkt[pos++] = our_node;                     /* src node (our router) */
+        ddp_pkt[pos++] = 2;                            /* src socket (NBP) */
+        ddp_pkt[pos++] = DDPTYPE_NBP;
+
+        /* Copy NBP payload (skip the 1-byte DDP type prefix in packet) */
+        memcpy(ddp_pkt + pos, packet + 1, cc - 1);
+
+        if (aurp_send_data(req_net, (char *)ddp_pkt, total_len) < 0) {
+            LOG(log_error, logtype_atalkd,
+                "nbp_send_lkupreply: AURP send to net %u failed", req_net);
+            return -1;
+        }
+        LOG(log_warning, logtype_atalkd,
+            "nbp lkup: forwarded LkUpReply via AURP to %u.%u.%u (id=%u)",
+            req_net, aurp_dest.sat_addr.s_node,
+            aurp_dest.sat_port, nh->nh_id);
+        return 0;
+    }
+
+    /* If the reply-to address is in the loopback network range (0xFF00+),
+     * we must send through the lo interface socket, not ens160, because
+     * the loopback AppleTalk network is unreachable via ens160. */
+    {
+        int send_fd = ap->ap_fd;
+        uint16_t dest_net = ntohs(dest->sat_addr.s_net);
+
+        if (dest_net >= 0xFF00) {
+            /* Find the lo interface's NBP socket */
+            struct interface *lo_iface;
+            struct atport *lo_ap;
+            for (lo_iface = interfaces; lo_iface; lo_iface = lo_iface->i_next) {
+                if (lo_iface->i_flags & IFACE_LOOPBACK) {
+                    for (lo_ap = lo_iface->i_ports; lo_ap; lo_ap = lo_ap->ap_next) {
+                        if (lo_ap->ap_port == 2) {
+                            send_fd = lo_ap->ap_fd;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (sendto(send_fd, packet, cc, 0,
+                   (struct sockaddr *)dest,
+                   sizeof(struct sockaddr_at)) < 0) {
+            LOG(log_warning, logtype_atalkd, "nbp lkup sendto %u.%u: %s",
+                ntohs(dest->sat_addr.s_net),
+                dest->sat_addr.s_node,
+                strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
 
 int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
 {
@@ -745,49 +852,38 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                     }
 
                     /* Build extended DDP header manually in correct byte order.
-                     * DDP Extended Header format (13 bytes):
+                     * DDP Extended Header wire format (13 bytes) — verified vs jrouter:
                      *   [0-1]  hop (4 bits) + length (10 bits)
                      *   [2-3]  checksum
                      *   [4-5]  destination network
-                     *   [6-7]  source network
-                     *   [8]    destination node
-                     *   [9]    source node
-                     *   [10]   destination socket
+                     *   [6]    destination node
+                     *   [7]    destination socket
+                     *   [8-9]  source network
+                     *   [10]   source node
                      *   [11]   source socket
                      *   [12]   DDP type
                      */
                     int pos = 0;
 
-                    /* Bytes 0-1: Hop count (4 bits) + Length (10 bits) in BIG ENDIAN */
                     uint16_t hop_len = (0 << 10) | (total_len & 0x3FF);
-                    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;  /* High byte */
-                    ddp_packet[pos++] = hop_len & 0xFF;         /* Low byte */
+                    ddp_packet[pos++] = (hop_len >> 8) & 0xFF;
+                    ddp_packet[pos++] = hop_len & 0xFF;
 
-                    /* Bytes 2-3: Checksum (0x0000) */
-                    ddp_packet[pos++] = 0x00;
+                    ddp_packet[pos++] = 0x00;  /* checksum */
                     ddp_packet[pos++] = 0x00;
 
-                    /* Bytes 4-5: Destination Network (big-endian) */
-                    ddp_packet[pos++] = (dst_net >> 8) & 0xFF;
+                    ddp_packet[pos++] = (dst_net >> 8) & 0xFF;       /* dst net */
                     ddp_packet[pos++] = dst_net & 0xFF;
 
-                    /* Bytes 6-7: Source Network (big-endian) */
-                    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;
+                    ddp_packet[pos++] = sat.sat_addr.s_node;          /* dst node */
+                    ddp_packet[pos++] = sat.sat_port;                  /* dst socket */
+
+                    ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;  /* src net */
                     ddp_packet[pos++] = src_net_host & 0xFF;
 
-                    /* Byte 8: Destination Node (0 for zone broadcast) */
-                    ddp_packet[pos++] = sat.sat_addr.s_node;
+                    ddp_packet[pos++] = src_node;                      /* src node */
+                    ddp_packet[pos++] = src_socket;                    /* src socket */
 
-                    /* Byte 9: Source Node */
-                    ddp_packet[pos++] = src_node;
-
-                    /* Byte 10: Destination Socket (NBP = 2) */
-                    ddp_packet[pos++] = sat.sat_port;
-
-                    /* Byte 11: Source Socket */
-                    ddp_packet[pos++] = src_socket;
-
-                    /* Byte 12: DDP Type (NBP = 0x02) */
                     ddp_packet[pos++] = DDPTYPE_NBP;
 
                     /* Copy NBP data after DDP header
@@ -893,7 +989,12 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
             nn.nn_zonelen, nn.nn_zone,
             ntohs(from->sat_addr.s_net), from->sat_addr.s_node, from->sat_port);
 
-        /* do not send replies from the loopback interface */
+        /* Skip LkUps arriving on the loopback interface.  Sending DDP replies
+         * through the lo socket can trigger a kernel D-state hang in
+         * synchronize_rcu_normal.  The ens160 copy of the same LkUp will find
+         * loopback-registered entries (afpd) via the IFACE_LOOPBACK exception
+         * in the interface-matching logic below, and handle AURP forwarding
+         * inline (without needing a DDP round-trip). */
         if (ap->ap_iface->i_flags & IFACE_LOOPBACK) {
             return 0;
         }
@@ -954,15 +1055,17 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                         ddp_packet[pos++] = hop_len & 0xFF;
                         ddp_packet[pos++] = 0x00;  /* Checksum */
                         ddp_packet[pos++] = 0x00;
-                        ddp_packet[pos++] = (dst_net >> 8) & 0xFF;  /* Bytes 4-5: dst_net */
+                        /* DDP extended header wire format: dst_net, dst_node, dst_socket,
+                         * src_net, src_node, src_socket (verified vs jrouter captures). */
+                        ddp_packet[pos++] = (dst_net >> 8) & 0xFF;  /* dst net */
                         ddp_packet[pos++] = dst_net & 0xFF;
-                        ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;  /* Bytes 6-7: src_net */
+                        ddp_packet[pos++] = 0;                       /* dst node (0 = any router) */
+                        ddp_packet[pos++] = 2;                       /* dst socket (NBP) */
+                        ddp_packet[pos++] = (src_net_host >> 8) & 0xFF;  /* src net */
                         ddp_packet[pos++] = src_net_host & 0xFF;
-                        ddp_packet[pos++] = 0;     /* Byte 8: dst_node (0 = zone broadcast) */
-                        ddp_packet[pos++] = src_node;  /* Byte 9: src_node */
-                        ddp_packet[pos++] = 2;     /* Byte 10: dst_socket (NBP = 2) */
-                        ddp_packet[pos++] = src_socket;  /* Byte 11: src_socket */
-                        ddp_packet[pos++] = DDPTYPE_NBP;  /* Byte 12: ddp_type */
+                        ddp_packet[pos++] = src_node;                /* src node */
+                        ddp_packet[pos++] = src_socket;              /* src socket */
+                        ddp_packet[pos++] = DDPTYPE_NBP;
                         
                         /* Convert LkUp to FwdReq */
                         struct nbphdr nh_fwd;
@@ -998,10 +1101,30 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
         data = packet + 1 + SZ_NBPHDR;
         end = packet + sizeof(packet);
 
+        LOG(log_info, logtype_atalkd,
+            "nbp lkup: searching nbptab (obj='%.*s' type='%.*s' zone='%.*s') from %u.%u.%u",
+            nn.nn_objlen, nn.nn_obj, nn.nn_typelen, nn.nn_type,
+            nn.nn_zonelen, nn.nn_zone,
+            ntohs(from->sat_addr.s_net), from->sat_addr.s_node, from->sat_port);
+
         for (ntab = nbptab; ntab; ntab = ntab->nt_next) {
-            /* don't send out entries if we don't want to route. */
+            LOG(log_info, logtype_atalkd,
+                "nbp lkup: checking '%.*s:%.*s@%.*s' iface=%s (ap_iface=%s flags=0x%x)",
+                ntab->nt_nve.nn_objlen, ntab->nt_nve.nn_obj,
+                ntab->nt_nve.nn_typelen, ntab->nt_nve.nn_type,
+                ntab->nt_nve.nn_zonelen, ntab->nt_nve.nn_zone,
+                ntab->nt_iface->i_name, ap->ap_iface->i_name,
+                ntab->nt_iface->i_flags);
+
+            /* don't send out entries if we don't want to route.
+             * Exception: loopback-registered services (e.g. afpd) are
+             * local to this machine and should be visible on all real
+             * interfaces regardless of which interface the LkUp arrived on. */
             if ((ap->ap_iface != ntab->nt_iface) &&
-                    (ntab->nt_iface->i_flags & IFACE_ISROUTER) == 0) {
+                    (ntab->nt_iface->i_flags & IFACE_ISROUTER) == 0 &&
+                    (ntab->nt_iface->i_flags & IFACE_LOOPBACK) == 0) {
+                LOG(log_info, logtype_atalkd, "nbp lkup: SKIP (iface mismatch, flags=0x%x)",
+                    ntab->nt_iface->i_flags);
                 continue;
             }
 
@@ -1030,11 +1153,22 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                         zt = (struct ziptab *)interfaces->i_next->i_rt->
                              rt_zt->l_data;
 
+                        LOG(log_info, logtype_atalkd,
+                            "nbp lkup: zone check: zt='%.*s' vs query='%.*s' (iface=%s i_next=%s)",
+                            zt->zt_len, zt->zt_name,
+                            nn.nn_zonelen, nn.nn_zone,
+                            interfaces->i_name, interfaces->i_next->i_name);
+
                         if (zt->zt_len != nn.nn_zonelen ||
                                 strndiacasecmp(zt->zt_name, nn.nn_zone,
                                                zt->zt_len)) {
+                            LOG(log_info, logtype_atalkd, "nbp lkup: SKIP (zone mismatch)");
                             continue;
                         }
+                    } else {
+                        LOG(log_info, logtype_atalkd,
+                            "nbp lkup: rt_zt is NULL for %s->%s (accepting wildcard zone entry)",
+                            interfaces->i_name, interfaces->i_next->i_name);
                     }
                 } else {
                     if (ntab->nt_nve.nn_zonelen != nn.nn_zonelen ||
@@ -1058,13 +1192,8 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
                 *data++ = DDPTYPE_NBP;
                 memcpy(data, &nh, SZ_NBPHDR);
 
-                if (sendto(ap->ap_fd, packet, cc, 0,
-                           (struct sockaddr *)&nn.nn_sat,
-                           sizeof(struct sockaddr_at)) < 0) {
-                    LOG(log_error, logtype_atalkd, "nbp lkup sendto %u.%u: %s",
-                        ntohs(nn.nn_sat.sat_addr.s_net),
-                        nn.nn_sat.sat_addr.s_node,
-                        strerror(errno));
+                if (nbp_send_lkupreply(ap, packet, cc, &nn.nn_sat,
+                                        &nh) < 0) {
                     return 0;
                 }
 
@@ -1118,13 +1247,13 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
             *data++ = DDPTYPE_NBP;
             memcpy(data, &nh, SZ_NBPHDR);
 
-            if (sendto(ap->ap_fd, packet, cc, 0,
-                       (struct sockaddr *)&nn.nn_sat,
-                       sizeof(struct sockaddr_at)) < 0) {
-                LOG(log_error, logtype_atalkd, "nbp lkup sendto %u.%u: %s",
-                    ntohs(nn.nn_sat.sat_addr.s_net),
-                    nn.nn_sat.sat_addr.s_node,
-                    strerror(errno));
+            LOG(log_info, logtype_atalkd,
+                "nbp lkup: sending LkUpReply (%d entries) to %u.%u.%u via iface=%s (id=%u)",
+                n, ntohs(nn.nn_sat.sat_addr.s_net), nn.nn_sat.sat_addr.s_node,
+                nn.nn_sat.sat_port, ap->ap_iface->i_name, nh.nh_id);
+
+            if (nbp_send_lkupreply(ap, packet, cc, &nn.nn_sat,
+                                    &nh) < 0) {
                 return 0;
             }
         }
@@ -1179,14 +1308,16 @@ int nbp_packet(struct atport *ap, struct sockaddr_at *from, char *data, int len)
             ddp_pkt[pos++] = hop_len & 0xFF;
             ddp_pkt[pos++] = 0x00;  /* checksum */
             ddp_pkt[pos++] = 0x00;
-            ddp_pkt[pos++] = (req_net >> 8) & 0xFF;    /* dst net */
+            /* DDP extended header wire format: dst_net, dst_node, dst_socket,
+             * src_net, src_node, src_socket (verified vs jrouter captures). */
+            ddp_pkt[pos++] = (req_net >> 8) & 0xFF;     /* dst net */
             ddp_pkt[pos++] = req_net & 0xFF;
-            ddp_pkt[pos++] = (src_net_h >> 8) & 0xFF;  /* src net */
+            ddp_pkt[pos++] = requester.sat_addr.s_node;  /* dst node */
+            ddp_pkt[pos++] = requester.sat_port;          /* dst socket */
+            ddp_pkt[pos++] = (src_net_h >> 8) & 0xFF;   /* src net */
             ddp_pkt[pos++] = src_net_h & 0xFF;
-            ddp_pkt[pos++] = requester.sat_addr.s_node; /* dst node */
-            ddp_pkt[pos++] = from->sat_addr.s_node;     /* src node */
-            ddp_pkt[pos++] = requester.sat_port;         /* dst socket */
-            ddp_pkt[pos++] = from->sat_port;             /* src socket */
+            ddp_pkt[pos++] = from->sat_addr.s_node;      /* src node */
+            ddp_pkt[pos++] = from->sat_port;              /* src socket */
             ddp_pkt[pos++] = DDPTYPE_NBP;
 
             memcpy(ddp_pkt + pos, nbpop, len);

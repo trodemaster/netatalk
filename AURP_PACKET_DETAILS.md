@@ -712,6 +712,13 @@ This sequence traces machine discovery from AURP reception through NBP forwardin
   - Matches jrouter code path: requester appears as DDP source while the tuple reply‑to targets the requester.
   - See [netatalk/etc/atalkd/nbp.c](netatalk/etc/atalkd/nbp.c)
 
+3) **DDP extended header field order (critical, fixed Feb 25, 2026)**
+  - All DDP packet construction sites in `nbp.c` and the DDP parser in `aurp.c` were using the **wrong field order**: src_net at bytes 6-7, dst_node at byte 8, dst_socket at byte 10.
+  - The **correct wire format** (verified against jrouter captures) is: dst_node at byte 6, dst_socket at byte 7, src_net at bytes 8-9, src_node at byte 10, src_socket at byte 11.
+  - This caused all outbound FwdReq to carry `dst_socket = src_net_high_byte` (≈130 for net 650) instead of `dst_socket = 2` (NBP), so remote peers' `DstSocket==2` guard dropped every FwdReq we sent — explaining the **zero inbound FwdReq responses**.
+  - Fixed in five locations in `nbp.c`: `nbp_send_zone_multicast`, BRRQ AURP forwarding block, BRRQ FwdReq builder, `nbp_send_lkupreply`, and `NBPOP_LKUPREPLY` handler.
+  - Fixed in one location in `aurp.c`: `aurp_handle_data` DDP parser comment and byte reads.
+
 **Remaining**
 
 None currently documented.
@@ -720,7 +727,7 @@ None currently documented.
 
 - Long capture on UDP/387 shows inbound AURP control packets only (ZI/Open/Tickle). No inbound AppleTalk data (type $0x0002$) was observed.
 - Outbound AURP AppleTalk data was present, but peers did not respond with data payloads.
-- This indicates peer‑side behavior (or routing/forwarding policy) is currently the blocker, not local packet formatting.
+- **Root cause identified Feb 25, 2026**: The wrong DDP field order was causing `dst_socket` to carry the high byte of our source network (≈0x8a = 138) instead of 2 (NBP), so peers silently dropped all outbound FwdReq. This is now fixed.
 
 ### jrouter startup capture clues (Jan 14, 2026)
 
